@@ -2,6 +2,7 @@ package com.lyricsapp.receiver
 
 import android.graphics.Typeface
 import android.os.Bundle
+import android.net.wifi.WifiManager
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -61,6 +62,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var nsdRegistrar: NsdRegistrar
     private lateinit var mediaServer: EmbeddedMediaServer
     private lateinit var displayPreferences: DisplayPreferences
+    private var wifiLock: WifiManager.WifiLock? = null
     
     private val slides = mutableStateListOf<String>()
     private var currentSlideIndex by mutableStateOf(0)
@@ -95,6 +97,7 @@ class MainActivity : ComponentActivity() {
     private var backgroundType by mutableStateOf("COLOR")
     private var backgroundValue by mutableStateOf("#1E3A8A")
     private var backgroundColorHex by mutableStateOf("#1E3A8A")
+    private var backgroundGradientEndColor by mutableStateOf("#FF1E3A8A")
     
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -108,8 +111,7 @@ class MainActivity : ComponentActivity() {
         }
         deviceName = NsdRegistrar.getDeviceName(applicationContext)
         ipAddress = getLocalIpAddress()
-        mediaServer = EmbeddedMediaServer(cacheDir, onReady = { mediaId, type ->
-            val url = "http://$ipAddress:8766/media/$mediaId"
+        mediaServer = EmbeddedMediaServer(cacheDir, mediaUrlFor = ::resolveMediaUrl, onReady = { mediaId, type, url ->
             wsServer.sendToController(JSONObject().put("type", "MEDIA_READY").put("mediaId", mediaId).put("url", url).put("mediaType", type).put("timestamp", System.currentTimeMillis()).toString())
         }, onError = { reason -> wsServer.sendToController(JSONObject().put("type", "MEDIA_ERROR").put("reason", reason).put("timestamp", System.currentTimeMillis()).toString()) })
         mediaServer.start()
@@ -117,13 +119,17 @@ class MainActivity : ComponentActivity() {
         wsServer = SimpleWebSocketServer(
             port = 8765,
             onMessageReceived = { message ->
-                lifecycleScope.launch(Dispatchers.Main) {
-                    handleIncomingMessage(message)
+                val type = runCatching { JSONObject(message).optString("type") }.getOrDefault("")
+                if (type == "HEARTBEAT") {
+                    wsServer.sendToController("""{"type":"HEARTBEAT_ACK","timestamp":${System.currentTimeMillis()}}""")
+                } else {
+                    lifecycleScope.launch(Dispatchers.Main) { handleIncomingMessage(message) }
                 }
             },
             onConnectionChanged = { connected ->
                 lifecycleScope.launch(Dispatchers.Main) {
                     isConnected = connected
+                    if (connected) acquireWifiLock() else releaseWifiLock()
                     if (!connected) {
                         displayText = "Connection lost. Waiting for controller..."
                         ipAddress = getLocalIpAddress()
@@ -163,6 +169,7 @@ class MainActivity : ComponentActivity() {
                 backgroundType = backgroundType,
                 backgroundValue = backgroundValue,
                 backgroundColorHex = backgroundColorHex,
+                backgroundGradientEndColor = backgroundGradientEndColor,
                 backgroundVisible = backgroundVisible,
                 backgroundPlayerRetained = backgroundPlayerRetained,
                 lyricsVisible = lyricsVisible,
@@ -218,6 +225,7 @@ class MainActivity : ComponentActivity() {
                         } else if (!backgroundVisible) {
                             backgroundType = settings.optString("backgroundType", "COLOR").uppercase()
                             backgroundValue = settings.optString("backgroundValue", backgroundColorHex)
+                            backgroundGradientEndColor = settings.optString("backgroundGradientEndColor", backgroundGradientEndColor)
                             if (backgroundType == "COLOR" || backgroundType == "SOLID") backgroundColorHex = backgroundValue
                         }
                         overlayDim = settings.optInt("overlayDimPercent", 0).coerceIn(0, 100)
@@ -282,8 +290,10 @@ class MainActivity : ComponentActivity() {
                 }
                 "SET_BACKGROUND" -> {
                     val mediaId = json.optString("mediaId", "")
-                    if (mediaId.isNotBlank()) {
-                        backgroundValue = json.optString("mediaUrl").takeIf { it.startsWith("http://") || it.startsWith("https://") } ?: "http://$ipAddress:8766/media/$mediaId"
+                    val requestedUrl = json.optString("mediaUrl").takeIf { it.startsWith("http://") || it.startsWith("https://") }
+                    val mediaUrl = requestedUrl?.takeIf { !it.contains("localhost") && !it.contains("127.0.0.1") } ?: resolveMediaUrl(mediaId)
+                    if (mediaId.isNotBlank() && !mediaUrl.isNullOrBlank()) {
+                        backgroundValue = mediaUrl
                         backgroundType = json.optString("mediaType", json.optString("type", "IMAGE")).uppercase().let { if (it == "SET_BACKGROUND") "IMAGE" else it }
                         mediaFit = json.optString("fit", "FILL").uppercase()
                         mediaLoop = json.optBoolean("loop", true)
@@ -292,6 +302,8 @@ class MainActivity : ComponentActivity() {
                         backgroundPlayerRetained = backgroundType == "VIDEO"
                         Log.i("BackgroundLayer", "Background set: type=$backgroundType fit=$mediaFit")
                         isBlank = false
+                    } else {
+                        wsServer.sendToController(JSONObject().put("type", "MEDIA_ERROR").put("mediaId", mediaId).put("reason", "Receiver media address is unavailable").put("timestamp", System.currentTimeMillis()).toString())
                     }
                 }
                 "CLEAR_BACKGROUND" -> { backgroundVisible = false; backgroundPlayerRetained = false; isBlank = !lyricsVisible; Log.i("BackgroundLayer", "Background cleared") }
@@ -318,6 +330,7 @@ class MainActivity : ComponentActivity() {
                     fontSize = template.optInt("fontSize", fontSize)
                     textColor = template.optString("textColor", textColor)
                     backgroundColorHex = template.optString("backgroundColor", backgroundColorHex)
+                    backgroundGradientEndColor = template.optString("backgroundGradientEndColor", backgroundGradientEndColor)
                     val templateBackgroundType = template.optString("backgroundType", backgroundType).uppercase()
                     if (!backgroundVisible) {
                         backgroundType = if (templateBackgroundType == "SOLID") "COLOR" else templateBackgroundType
@@ -351,23 +364,39 @@ class MainActivity : ComponentActivity() {
             }
             if (type != "HEARTBEAT") {
                 val hasLyrics = !isBlank && !isBlackScreen && displayText.isNotEmpty() && lyricsVisible
-                val ok = type != "JUMP_SLIDE" || json.optInt("slideIndex", -1) in slides.indices
+                val ok = when (type) {
+                    "JUMP_SLIDE" -> json.optInt("slideIndex", -1) in slides.indices
+                    "SET_BACKGROUND" -> {
+                        val url = json.optString("mediaUrl")
+                        json.optString("mediaId").isNotBlank() &&
+                            ((url.startsWith("http://") || url.startsWith("https://")) && !url.contains("localhost") && !url.contains("127.0.0.1") || resolveMediaUrl(json.optString("mediaId")) != null)
+                    }
+                    else -> true
+                }
                 wsServer.sendToController(JSONObject().apply {
                     put("type", "ACK")
                     put("receivedMessageType", type)
                     put("success", ok)
                     put("currentSlide", currentSlideIndex)
-                    put("error", if (ok) JSONObject.NULL else "Slide index out of bounds")
+                    put("error", if (ok) JSONObject.NULL else if (type == "SET_BACKGROUND") "Receiver media address is unavailable" else "Slide index out of bounds")
                     put("screenState", when { isBlackScreen -> "BLACK"; isBlank -> "BLANK"; else -> "CONTENT" })
                     put("layerState", JSONObject().put("background", backgroundVisible).put("lyrics", hasLyrics).put("overlay", overlayDim > 0))
+                    if (type == "SET_BACKGROUND") put("mediaId", json.optString("mediaId"))
                     if (type == "HANDSHAKE") {
                         put("protocolVersion", 2)
                         put("mediaPort", 8766)
+                        wsServer.getActiveLocalHost()?.let { put("mediaHost", it) }
                         put("screenWidthDp", resources.configuration.screenWidthDp)
                         put("screenHeightDp", resources.configuration.screenHeightDp)
                     }
+                    put("commandTimestamp", json.optLong("timestamp", 0L))
+                    put("renderTimestamp", System.currentTimeMillis())
                     put("timestamp", System.currentTimeMillis())
                 }.toString())
+                if (type in setOf("NEXT_SLIDE", "PREV_SLIDE", "JUMP_SLIDE")) {
+                    val sent = json.optLong("timestamp", 0L)
+                    if (sent > 0L) Log.d("SlideLatency", "command=$type commandToRenderMs=${(System.currentTimeMillis() - sent).coerceAtLeast(0L)} slide=$currentSlideIndex")
+                }
             }
         } catch (e: Exception) {
             Log.e("MainActivity", "Error parsing message: $rawJson", e)
@@ -391,6 +420,7 @@ class MainActivity : ComponentActivity() {
     
     override fun onDestroy() {
         super.onDestroy()
+        releaseWifiLock()
         nsdRegistrar.unregisterService()
         wsServer.stop()
         mediaServer.stop()
@@ -428,7 +458,7 @@ class MainActivity : ComponentActivity() {
                 for (addr in addresses) {
                     if (!addr.isLoopbackAddress && addr is Inet4Address) {
                         val ip = addr.hostAddress ?: continue
-                        if (!ip.startsWith("127.")) {
+                        if (!ip.startsWith("127.") && ip != "0.0.0.0") {
                             return ip
                         }
                     }
@@ -438,6 +468,29 @@ class MainActivity : ComponentActivity() {
             e.printStackTrace()
         }
         return "Unavailable"
+    }
+
+    private fun resolveMediaUrl(mediaId: String): String? {
+        val host = if (::wsServer.isInitialized) wsServer.getActiveLocalHost() else null
+        val address = host ?: getLocalIpAddress().takeIf { it != "Unavailable" }
+        if (address.isNullOrBlank() || address.startsWith("127.") || address == "localhost" || address == "0.0.0.0" || address == "::1") return null
+        val urlHost = if (address.contains(':')) "[${address.replace("%", "%25")}]" else address
+        return "http://$urlHost:8766/media/$mediaId"
+    }
+
+    private fun acquireWifiLock() {
+        try {
+            if (wifiLock?.isHeld == true) return
+            val manager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+            wifiLock = manager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "$packageName:ReceiverWifi")
+                .apply { setReferenceCounted(false); acquire() }
+        } catch (error: Exception) { Log.w("BackgroundLayer", "Could not acquire receiver Wi-Fi lock", error) }
+    }
+
+    private fun releaseWifiLock() {
+        try { wifiLock?.takeIf { it.isHeld }?.release() }
+        catch (error: Exception) { Log.w("BackgroundLayer", "Could not release receiver Wi-Fi lock", error) }
+        wifiLock = null
     }
 }
 
@@ -456,6 +509,7 @@ fun ReceiverScreen(
     backgroundType: String,
     backgroundValue: String,
     backgroundColorHex: String = backgroundValue,
+    backgroundGradientEndColor: String = "#FF1E3A8A",
     backgroundVisible: Boolean = backgroundType == "IMAGE" || backgroundType == "VIDEO",
     backgroundPlayerRetained: Boolean = false,
     lyricsVisible: Boolean = !isBlank && !isBlackScreen,
@@ -478,7 +532,10 @@ fun ReceiverScreen(
     val vertical = when (verticalAlignment.lowercase()) { "top" -> Alignment.Top; "bottom" -> Alignment.Bottom; else -> Alignment.CenterVertically }
     val textAlign = when (horizontalAlignment.lowercase()) { "left" -> TextAlign.Start; "right" -> TextAlign.End; else -> TextAlign.Center }
     val renderBackgroundLayer = backgroundVisible || (backgroundPlayerRetained && (isBlack || !isConnected))
-    Box(Modifier.fillMaxSize().background(parseReceiverColor(backgroundColorHex, Color.Black))) {
+    val baseBrush = if (backgroundType.equals("GRADIENT", true)) {
+        Brush.verticalGradient(listOf(parseReceiverColor(backgroundColorHex, Color.Black), parseReceiverColor(backgroundGradientEndColor, Color.Black)))
+    } else Brush.verticalGradient(listOf(parseReceiverColor(backgroundColorHex, Color.Black), parseReceiverColor(backgroundColorHex, Color.Black)))
+    Box(Modifier.fillMaxSize().background(baseBrush)) {
         if (renderBackgroundLayer && backgroundType == "IMAGE" && backgroundValue.startsWith("http")) {
             AsyncImage(
                 model = coil.request.ImageRequest.Builder(LocalContext.current).data(backgroundValue).crossfade(350).build(),
@@ -494,7 +551,7 @@ fun ReceiverScreen(
         // so video position/playback survives BLACK_SCREEN and subsequent lyric changes.
         if (isBlack) Box(Modifier.fillMaxSize().background(Color.Black))
         if (!isBlack && lyricsVisible && displayText.isNotBlank()) {
-            Crossfade(targetState = displayText, animationSpec = tween(180), label = "receiver-lyrics") { slide ->
+            Crossfade(targetState = displayText, animationSpec = tween(90), label = "receiver-lyrics") { slide ->
                 Box(Modifier.fillMaxSize().padding(textPaddingDp.coerceAtLeast(0).dp), contentAlignment = Alignment.Center) {
                     Column(Modifier.fillMaxSize(), horizontalAlignment = horizontal, verticalArrangement = when (vertical) { Alignment.Top -> Arrangement.Top; Alignment.Bottom -> Arrangement.Bottom; else -> Arrangement.Center }) {
                         Text(

@@ -1,259 +1,134 @@
-# Mobile Lyrics Presenter for Choirs - Build Plan
+# Project Plan and Status
 
-This document defines the phased delivery plan for building the Android TV lyric presenter system. It is intentionally aligned with the real-world church-use workflow: a phone acts as the remote, and an Android TV acts as the display.
+This plan tracks the phone controller, Android TV receiver, and their shared local-network protocol. Feature checkmarks describe implemented code; they do not imply that physical-device acceptance testing has passed.
 
-## Goals
+## Product goals
 
-- Build a reliable local presentation system that works on Android TV
-- Keep setup simple: no laptop or desktop required
-- Use the phone as the live remote control for slides
-- Work on the same WiFi network or a phone hotspot
-- Keep the app fully usable offline without internet access
+- Operate a lyric presentation from a phone on the same local network as an Android TV.
+- Keep song/setlist data local and work without cloud services.
+- Make lyric navigation immediate and keep background media independent from lyric slides.
+- Recover from short network interruptions without losing the current presentation state.
 
-## Non-goals for MVP
+## Product workflow
 
-The MVP intentionally excludes:
+```mermaid
+flowchart TD
+    Pair[Discover / remember / manually enter receiver] --> Connect[Connect WebSocket]
+    Connect --> Blank[Handshake ACK · TV blank]
+    Blank --> Library[Choose song or setlist]
+    Library --> Style[Resolve template and song settings]
+    Style --> Display[Send DISPLAY snapshot]
+    Display --> Live[Live control]
+    Live --> Nav[Compact slide navigation]
+    Nav --> Live
+    Live --> MediaPick[Optional background from Media library]
+    MediaPick --> Transfer[HTTP upload to receiver cache]
+    Transfer --> Layer[SET_BACKGROUND]
+    Layer --> Live
+    Live --> Recovery{Network interrupted?}
+    Recovery -- No --> Live
+    Recovery -- Yes --> Retry[Reconnect with capped backoff]
+    Retry --> Blank
+    Blank --> Restore[Resend last display and active background]
+    Restore --> Live
+```
 
-- Google Cast fallback
-- FreeShow import
-- stage-view multi-operator support
-- cloud sync or remote hosting
+The flow distinguishes user content from device output. Songs and folders are
+local catalog data, templates are reusable style descriptions, and receiver
+layer state is the live output configuration. A connection handshake resets
+the TV to black; after the ACK, the controller restores the operator's intended
+state. In normal navigation only the current slide changes.
 
-## Architecture summary
+## Current implementation
+
+### Controller
+
+- [x] Local song library, editing, slide splitting, TXT import, and setlists.
+- [x] Fuzzy song search, title/author/recency sorting, and persistent folders for organizing songs.
+- [x] NSD discovery, manual IP entry, remembered receiver endpoint, and connection state.
+- [x] Foreground connection service with heartbeat, ping, reconnect, and saved presentation restore.
+- [x] Optimistic next/previous/jump state and compact slide-navigation commands.
+- [x] Live template/style controls, collapsible template options, color picker, and 16:9 creator preview.
+- [x] Custom/built-in template persistence and media library/upload controls.
+- [x] Issue/connection messages only; successful presentation changes do not create toast messages, which dismiss after one second.
+
+### Receiver
+
+- [x] Full-screen lyric display; connection/address status only while disconnected.
+- [x] Pure-black `BLANK` state on each WebSocket handshake.
+- [x] Independent lyrics, background, and overlay state, plus a separate black override.
+- [x] Receiver HTTP media upload/cache server with byte-range streaming.
+- [x] Coil image display, Media3 video playback, fit options, and playback controls.
+- [x] Background state retained across lyric changes and black/clear-lyrics commands.
+- [x] Preferred 4K display mode when exposed by the device.
+
+### Shared / protocol
+
+- [x] Backward-compatible protocol v2 handshake metadata, ACK state, layer commands, media messages, templates, and style updates.
+- [x] Shared song/slide/template/message models and protocol serialization tests.
+
+## Remaining verification
+
+- [ ] Build the complete project in the intended Android/Gradle environment.
+- [ ] Measure visible slide latency on a phone and TV on a normal Wi-Fi network.
+- [ ] Test 1080p JPEG and H.264 video uploads across two devices; verify byte-range seeking.
+- [ ] Exercise HEVC input and confirm the device either plays it or reports a clear, actionable error.
+- [ ] Run reconnect and background playback soak tests on physical devices.
+- [ ] Verify TV-specific 4K mode, D-pad behavior, and Telugu glyph line-height.
+- [ ] Inspect memory/player lifecycle behavior during extended media switching.
+
+## Architecture
 
 ```mermaid
 flowchart LR
-    A[Phone Controller App] --> B[Local WiFi / Hotspot]
-    B --> C[Android TV Receiver App]
-    C --> D[TV Display]
-    A --> E[Song library + setlist]
-    C --> F[Display settings]
+    C[Controller app] -->|WebSocket TCP 8765| R[Receiver app]
+    C -->|Chunked HTTP TCP 8766| R
+    R --> T[TV output]
+    C --> DB[Room: songs and setlists]
+    C --> DS[DataStore: preferences and templates]
 ```
 
-## Project constraints
+The receiver hosts media rather than sending bulk media bytes through the command socket. For the implementation rationale and device test steps, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
-- Must work on as many Android TV devices as possible
-- No manual IP entry when discovery works
-- No internet requirement for normal operation
-- must feel responsive for worship and rehearsal use
-- network interruptions should be handled gracefully
+## Data ownership and persistence
 
-## MVP feature checklist
+| Data | Owner | Persistence | Sent to receiver? |
+| --- | --- | --- | --- |
+| Song title, sections, slide text | Controller | Room | Yes, in `DISPLAY` when a song is loaded/restored |
+| Song folders and setlists | Controller | Room | Setlist selection resolves to songs; folder organization is not needed by TV |
+| Built-in templates | Shared source | Compiled into app | Full selected template can be sent |
+| Custom templates, colors, receiver choice | Controller | DataStore | Only the selected style/receiver endpoint is used in commands |
+| Picked local content URI | Controller | Persisted picker access where available | No; uploader reads it locally |
+| Uploaded media file | Receiver | App cache | Addressed through `mediaId` and receiver LAN URL |
+| Current TV slide and layer state | Receiver while running; controller recovery snapshot | In-memory receiver; controller persists recovery data | ACK reports receiver-confirmed state |
 
-### Controller app
-- [ ] Song library: create, edit, delete songs
-- [ ] Slide editor: split song text into slides by section
-- [ ] Setlist builder: queue songs in order
-- [ ] Live control: next, previous, jump, black, clear
-- [ ] Receiver discovery: scan local network
-- [ ] Connection health indicator
+The receiver does not open the controller's Room database or DataStore. The
+controller sends enough rendering information for the receiver to act without
+copying the controller's template catalog.
 
-### Receiver app
-- [ ] Full-screen lyric display
-- [ ] Adjustable font, size, colors, and background settings
-- [ ] Black screen state
-- [ ] Auto-listen for controller connections
-- [ ] Reconnect handling after brief WiFi problems
+## Feature boundaries
 
-### Shared / infrastructure
-- [ ] NSD/mDNS receiver discovery
-- [ ] WebSocket protocol with ack, heartbeat, and recovery
-- [ ] Local storage for songs and setlists
-- [ ] Connection pairing or simple device selection
+- **Library:** supports local create/edit/import, approximate search, sorting,
+  folders, and setlists. It has no cloud account or cross-device sync.
+- **Live control:** sends the initial display state, small navigation commands,
+  layer changes, and template/style updates. Connection/recovery feedback is
+  surfaced separately from successful presentation actions.
+- **Media:** transfer is phone-to-TV using chunked HTTP; playback is TV-local
+  via a receiver URL. This keeps large files out of the WebSocket channel.
+- **Receiver:** renders background, lyrics, overlay dim, and black override as
+  independent state. A TV-specific codec or display mode remains hardware
+  dependent.
 
-## Delivery phases
+## Risks and follow-up
 
-## Phase 1 — Protocol and connection foundation
+- **TV codec differences:** hardware decoders vary by model; surface playback errors and validate representative devices.
+- **Local network isolation:** guest Wi-Fi may block peer traffic or multicast; manual IP and phone hotspot are fallbacks.
+- **Android background limits:** foreground service and wake/Wi-Fi locks improve resilience, but OEM power settings may still require user configuration.
+- **Reclaimable cache:** Android may clear app cache; media may need to be uploaded again if an asset is unavailable.
+- **Preview parity:** the live preview uses the controller's local display state; visually compare against real output for TV-specific rendering differences.
 
-This is the highest-risk phase because the app must connect reliably over local WiFi before any song features are added.
+## Future ideas (not current commitments)
 
-### Phase 1 goals
-- establish the communication contract between phone and TV
-- prove the controller can connect to the receiver on the same network
-- prove the receiver can show live updates
-- handle reconnects and keep-alive traffic
-
-### Deliverables
-
-#### 1.1 Protocol definition
-- Define JSON message set for navigation actions and state updates
-- Document receiver acknowledgements and heartbeat flow
-- Define reconnect expectations and invalid-connection handling
-
-#### 1.2 TV receiver baseline
-- Minimal app starts and shows a screen
-- WebSocket listener is running on port 8765
-- Incoming message text is rendered to the display
-- App shows a connection status indicator
-
-#### 1.3 Phone controller baseline
-- App can open a WebSocket to a receiver host
-- User can send a hardcoded message to test the connection
-- App exposes a next/previous testing interface
-
-#### 1.4 Network discovery
-- Use NSD/mDNS to discover receiver devices
-- Surface discovered receivers in a list for the operator
-- Remove the need for manual host entry in the normal case
-
-#### 1.5 Reliability layer
-- Add heartbeat messages at a fixed interval
-- Handle closed sockets and dropped connections
-- Retry connection with exponential backoff
-- Restore display state after reconnection
-
-### Acceptance criteria
-- controller can successfully connect to receiver on same local network
-- `NEXT_SLIDE` message updates displayed text on the receiver
-- receiver acknowledges commands successfully
-- heartbeat prevents stale sockets from going unnoticed
-- reconnect works after a short WiFi interruption
-
-## Phase 2 — Song data model and editing
-
-Once the connection layer is proven, the app can start modeling lyrics as meaningful data rather than raw strings.
-
-### Phase 2 goals
-- represent songs as structured data
-- support editing and persistence locally
-- split lyrics into sections and slides in a natural way
-
-### Deliverables
-
-#### 2.1 Song and slide data model
-- `Song` entity with title, author, key, notes, and metadata
-- `Section` entity for verse, chorus, bridge, intro, outro
-- `Slide` entity representing the actual displayed lyric block
-
-#### 2.2 Local storage
-- Use Room or a lightweight local database for persistence
-- Save song library and setlist data offline
-- Support add, update, delete, and reorder operations
-
-#### 2.3 Slide editing
-- Auto-split lyrics by blank lines or section markers
-- Allow manual slide adjustments and reorder
-- Preserve section naming like Verse 1, Chorus, Bridge
-
-#### 2.4 Setlist builder
-- Build a queue of songs for a service or rehearsal
-- Reorder songs by drag or move operations
-- Simple service flow from first song to last
-
-### Acceptance criteria
-- user can create a song and save it locally
-- lyrics can be split into multiple slides without losing structure
-- setlist can be reordered and persisted
-- app still works fully offline
-
-## Phase 3 — Live control UI
-
-This phase is about the on-stage control experience: the operator must be able to run the presentation quickly and confidently.
-
-### Deliverables
-
-- current slide indicator
-- next/previous buttons
-- jump-to-slide menu or list
-- preview of upcoming slide text
-- setlist queue visible during service
-- black screen and clear state controls
-
-### Acceptance criteria
-- operator can run a service with minimal taps
-- live UI stays readable even in a fast-moving worship flow
-- slide changes are visible almost instantly on the TV
-
-## Phase 4 — TV display polish
-
-The TV should feel like a proper lyric screen rather than a raw debug view.
-
-### Deliverables
-
-- full-screen rendering
-- large text sizing tuned for TV distances
-- adjustable font, color, and background theme
-- support for background images and accent colors
-- smooth transitions between slide changes
-
-### Acceptance criteria
-- lyrics are readable from the typical seating distance
-- theme settings are persisted on the TV app
-- black screen feels immediate and intentional
-
-## Phase 5 — Reliability and compatibility pass
-
-This phase validates the real requirement: it must work on actual Android TV devices in real spaces.
-
-### Testing goals
-- test on several Android TV models and Android versions
-- verify behavior on phone hotspot networks
-- test repeated rapid control taps
-- validate reconnect behavior under flaky WiFi conditions
-
-### Acceptance criteria
-- no obvious compatibility breakage across common Android TV devices
-- WiFi interruptions do not leave the app permanently stuck
-- controls remain responsive during rapid use
-
-## Phase 6 — Optional future additions
-
-These features are outside the MVP but may be valuable later.
-
-- Google Cast fallback for TVs where sideloading is not possible
-- FreeShow import for easy song migration
-- multi-operator support
-- singer stage view
-
-## Milestones
-
-### Milestone 1 — first connection works
-Status: phase 1 complete
-
-- controller connects to receiver
-- messages flow across the network
-- connection is stable enough for a rehearsal demo
-
-### Milestone 2 — demo song playback works
-Status: phase 2 & 3 complete
-
-- song library exists
-- setlist is usable
-- actual lyrics render on TV display
-
-### Milestone 3 — church-ready usage test
-Status: phase 4 & 5 complete
-
-- layout is readable on TV
-- user can operate it with confidence
-- reconnects and hotspots are tested
-
-## Risk register
-
-### Risk 1: WiFi reliability
-Mitigation: heartbeat, exponential retry, and sending last state on reconnect.
-
-### Risk 2: Android TV compatibility
-Mitigation: keep receiver simple, avoid platform-specific assumptions, test on multiple devices.
-
-### Risk 3: Discovery complexity
-Mitigation: implement NSD with fallback to manual IP entry if discovery fails.
-
-### Risk 4: Use-case complexity of slide editing
-Mitigation: keep the editor simple and focused on the common church workflow before more advanced features.
-
-## Suggested implementation order
-
-1. Define protocol and message schema
-2. Build receiver with raw message display
-3. Build controller with connect and next/prev buttons
-4. Add discovery and heartbeats
-5. Add reconnect logic and state resync
-6. Build local song model and Room database
-7. Build setlist editor and live control screen
-8. Add TV display polish and theme settings
-9. Run compatibility and hotspot tests
-
-## Summary
-
-The project should be built in short, testable phases so the most risky technical part — local network reliability and Android TV compatibility — is solved before adding song management and display polish. That order reduces the chance of building a large UI around a fragile protocol.
+- Optional low-rate TV snapshot mirror for preview verification.
+- Media transcoding to a conservative TV-compatible profile.
+- FreeShow import, stage view, multi-operator support, or cloud sync.

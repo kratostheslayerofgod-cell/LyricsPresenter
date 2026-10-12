@@ -11,7 +11,8 @@ data class Song(
     val sections: List<SongSection> = emptyList(),
     val displaySettings: DisplaySettings = DisplaySettings(),
     val createdAt: Long = System.currentTimeMillis(),
-    val updatedAt: Long = createdAt
+    val updatedAt: Long = createdAt,
+    val folderId: String? = null
 ) {
     val slides: List<SongSlide>
         get() = sections.flatMap { section -> section.slides }
@@ -34,11 +35,12 @@ data class DisplaySettings(
     val backgroundMediaId: String? = null,
     val mediaFitMode: MediaFitMode = MediaFitMode.FILL,
     val templateId: String? = null,
-    val paddingDp: Int = 40
+    val paddingDp: Int = 40,
+    val backgroundGradientEndColor: String? = null
 )
 
 @Serializable
-enum class TemplateBackgroundType { SOLID, IMAGE, VIDEO, NONE }
+enum class TemplateBackgroundType { SOLID, GRADIENT, IMAGE, VIDEO, NONE }
 
 @Serializable
 enum class MediaFitMode { FILL, FIT, STRETCH }
@@ -66,7 +68,8 @@ data class Template(
     val mediaFitMode: MediaFitMode = MediaFitMode.FILL,
     val overlayDimPercent: Int = 0,
     val paddingDp: Int = 40,
-    val marginDp: Int = 0
+    val marginDp: Int = 0,
+    val backgroundGradientEndColor: String? = null
 )
 
 /** Applies a template to existing song display settings without changing the song/Room schema. */
@@ -76,11 +79,13 @@ fun Template.toDisplaySettings(base: DisplaySettings = DisplaySettings()): Displ
     textColor = textColor,
     backgroundType = when (backgroundType) {
         TemplateBackgroundType.SOLID -> "COLOR"
+        TemplateBackgroundType.GRADIENT -> "GRADIENT"
         TemplateBackgroundType.IMAGE -> "IMAGE"
         TemplateBackgroundType.VIDEO -> "VIDEO"
         TemplateBackgroundType.NONE -> "NONE"
     },
-    backgroundValue = if (backgroundType == TemplateBackgroundType.SOLID) backgroundColor else base.backgroundValue,
+    backgroundValue = if (backgroundType == TemplateBackgroundType.SOLID || backgroundType == TemplateBackgroundType.GRADIENT) backgroundColor else base.backgroundValue,
+    backgroundGradientEndColor = backgroundGradientEndColor.takeIf { backgroundType == TemplateBackgroundType.GRADIENT },
     textBold = bold,
     textItalic = italic,
     horizontalAlignment = horizontalAlignment,

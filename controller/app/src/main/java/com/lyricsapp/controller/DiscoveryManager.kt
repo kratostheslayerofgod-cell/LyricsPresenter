@@ -48,7 +48,7 @@ class DiscoveryManager(
         private const val TAG = "DiscoveryManager"
 
         const val SERVICE_TYPE = "_lyricsapp._tcp."
-        private const val RESCAN_INTERVAL_MS = 10_000L
+        private const val RESCAN_INTERVAL_MS = 30_000L
         private const val MAX_CONCURRENT_RESOLVES = 4
 
         fun isEmulator(): Boolean {
@@ -118,8 +118,7 @@ class DiscoveryManager(
     private fun beginDiscovery() {
         stopListener()
         synchronized(found) {
-            found.clear()
-            if (isEmulator()) {
+            if (isEmulator() && !found.containsKey("emulator_tv")) {
                 found["emulator_tv"] = DiscoveredReceiver(
                     name = "Android TV Emulator (10.0.2.2)",
                     host = "10.0.2.2",

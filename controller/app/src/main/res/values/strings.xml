@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">WorshipCast Mobile</string>
+    <string name="app_name">Lyrics Presenter </string>
     <string name="msg_connected">Connected to TV</string>
     <string name="msg_connected_cause">The display is ready for your next song.</string>
     <string name="msg_lyrics_sent">Lyrics sent</string>

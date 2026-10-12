@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-12
+
+- Expanded template creation and editing controls to cover screenshot-referenced typography, alignment, spacing, safe-area padding, media fit, dim level, swatches/custom colors, gradient backgrounds, and selection of imported background media. Template JSON carries optional gradient-end and outline color values through to receiver rendering.
+- Added fuzzy title/author search, relevance/title/author/recency sorting, and persistent song folders with move, rename, and delete management.
+- Added a Room 2→3 migration for folder assignment and folder records; deleting a folder leaves its songs safely unfiled.
+- Restricted transient messages to connection events and warnings/errors; successful presentation changes and routine media-ready events no longer interrupt the live workflow.
+- Reduced transient message visibility from five seconds to one second.
+- Refreshed the repository guides to describe current layer behavior, ports, media routing, connection recovery, and device validation status. The Phase 1 note is now explicitly historical.
+- Expanded Markdown guides with controller/receiver/shared module maps, library-to-live and media-transfer diagrams, a layer-command behavior matrix, data-persistence ownership, setup workflows, and troubleshooting paths.
+
 ## 2026-10-06
 
 - Made the live-session template list expandable and collapsible; it starts compact to leave more room for live controls.
@@ -16,4 +26,3 @@
 - Added controller-to-receiver chunked media uploads over HTTP, receiver cache storage and byte-range streaming, plus fill/fit/stretch and Media3 playback controls.
 - Added five built-in templates and a 16:9 editor for persistent custom templates; custom styles can be duplicated, renamed, deleted, made default, and applied live.
 - Trade-offs: receiver media cache is reclaimable and files are capped at 2 GiB. Device soak testing and real TV codec validation remain necessary; video thumbnails use a generic tile until playback begins.
-# Changelog

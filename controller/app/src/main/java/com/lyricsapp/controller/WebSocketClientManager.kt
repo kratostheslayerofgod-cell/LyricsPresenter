@@ -19,6 +19,10 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
+import java.net.Socket
+import java.net.InetAddress
+import javax.net.SocketFactory
+import kotlinx.coroutines.channels.Channel
 
 /** Service-owned WebSocket client. Callback and parsing failures are contained on OkHttp threads. */
 class WebSocketClientManager(
@@ -31,7 +35,7 @@ class WebSocketClientManager(
     companion object {
         private const val TAG = "PresentationService"
         private const val WS_PORT = 8765
-        private const val HEARTBEAT_INTERVAL_MS = 10_000L
+        private const val HEARTBEAT_INTERVAL_MS = 30_000L
         private const val MAX_RETRY_MS = 16_000L
         private const val PREFS = "presentation_connection"
     }
@@ -39,17 +43,35 @@ class WebSocketClientManager(
     private val preferences = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     private val exceptionHandler = CoroutineExceptionHandler { _, error -> Log.e(TAG, "Unhandled connection coroutine failure", error) }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + exceptionHandler)
+    private val slideCommands = Channel<Triple<String, Int?, Long>>(Channel.UNLIMITED)
+    private val slideCommandWorker = scope.launch {
+        for ((type, index, timestamp) in slideCommands) {
+            try {
+                val message = JSONObject().apply {
+                    put("type", type)
+                    if (index != null) put("slideIndex", index)
+                    put("timestamp", timestamp)
+                }.toString()
+                Log.d("SlideLatency", "event=send command=$type timestamp=$timestamp queuedMs=${(System.currentTimeMillis() - timestamp).coerceAtLeast(0L)}")
+                sendMessage(message)
+            } catch (error: Exception) { Log.e(TAG, "Slide command send failed", error) }
+        }
+    }
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .writeTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(10, TimeUnit.SECONDS)
+        .pingInterval(25, TimeUnit.SECONDS)
+        .socketFactory(TcpNoDelaySocketFactory)
         .build()
 
     @Volatile private var webSocket: WebSocket? = null
     @Volatile private var isConnected = false
     @Volatile private var isConnecting = false
     @Volatile private var currentHost: String? = preferences.getString("host", null)
+    @Volatile private var currentPort: Int = preferences.getInt("port", WS_PORT)
+    @Volatile private var activeMediaHost: String? = null
+    @Volatile private var activeMediaPort: Int = 8766
     @Volatile private var isUserDisconnect = false
     @Volatile private var lossHandled = false
     @Volatile private var missedHeartbeats = 0
@@ -58,7 +80,7 @@ class WebSocketClientManager(
     private var reconnectJob: Job? = null
     private var retryDelayMs = 1_000L
 
-    fun connect(receiverHost: String) {
+    fun connect(receiverHost: String, receiverPort: Int = WS_PORT) {
         val rawHost = receiverHost.trim().removePrefix("ws://").removePrefix("http://").removePrefix("/").substringBefore('/')
         val cleanHost = when {
             rawHost.startsWith("[") -> rawHost.substringAfter('[').substringBefore(']')
@@ -70,7 +92,8 @@ class WebSocketClientManager(
             return
         }
         isUserDisconnect = false
-        if (currentHost != null && currentHost != cleanHost && (isConnected || isConnecting)) {
+        val requestedPort = receiverPort.coerceIn(1, 65535)
+        if ((currentHost != null && (currentHost != cleanHost || currentPort != requestedPort)) && (isConnected || isConnecting)) {
             val previousSocket = webSocket
             webSocket = null
             isConnected = false
@@ -80,7 +103,8 @@ class WebSocketClientManager(
             runCatching { previousSocket?.cancel() }
         }
         currentHost = cleanHost
-        preferences.edit().putString("host", cleanHost).apply()
+        currentPort = requestedPort
+        preferences.edit().putString("host", cleanHost).putInt("port", currentPort).apply()
         retryDelayMs = 1_000L
         reconnectJob?.cancel()
         connectInternal(cleanHost)
@@ -95,7 +119,7 @@ class WebSocketClientManager(
         try {
             webSocket?.close(1000, "Reconnecting")
             val urlHost = if (host.contains(':')) "[${host.replace("%", "%25")}]" else host
-            webSocket = httpClient.newWebSocket(Request.Builder().url("ws://$urlHost:$WS_PORT").build(), this)
+            webSocket = httpClient.newWebSocket(Request.Builder().url("ws://$urlHost:$currentPort").build(), this)
         } catch (error: Exception) {
             Log.e(TAG, "Unable to create WebSocket for $host", error)
             isConnecting = false
@@ -185,6 +209,12 @@ class WebSocketClientManager(
         }
     }
 
+    /** Queues compact navigation commands; JSON encoding stays off the UI thread. */
+    fun sendSlideCommand(type: String, slideIndex: Int? = null, timestamp: Long = System.currentTimeMillis()): Boolean {
+        if (type !in setOf("NEXT_SLIDE", "PREV_SLIDE", "JUMP_SLIDE")) return false
+        return slideCommands.trySend(Triple(type, slideIndex, timestamp)).isSuccess
+    }
+
     /** Called after the receiver's blank-on-connect HANDSHAKE ACK. */
     fun restoreLastState() {
         try {
@@ -196,9 +226,9 @@ class WebSocketClientManager(
             val lyricsClear = preferences.getString("lyricsClear", null)
             val blackOverride = preferences.getString("blackOverride", null)
             val overlayClear = preferences.getString("overlayClear", null)
-            background?.let { sendRaw(it) }
-            display?.let { sendRaw(it) }
-            style?.let { sendRaw(it) }
+            background?.let { sendRaw(rewriteMediaUrls(it)) }
+            display?.let { sendRaw(rewriteMediaUrls(it)) }
+            style?.let { sendRaw(rewriteMediaUrls(it)) }
             clearAll?.let { sendRaw(it) }
             lyricsClear?.let { sendRaw(it) }
             blackOverride?.let { sendRaw(it) }
@@ -207,6 +237,33 @@ class WebSocketClientManager(
         } catch (error: Exception) {
             Log.e(TAG, "Unable to restore presentation state", error)
         }
+    }
+
+    fun setMediaEndpoint(host: String?, port: Int) {
+        activeMediaHost = host?.takeIf { it.isNotBlank() && it != "localhost" && it != "127.0.0.1" }
+        activeMediaPort = port.coerceIn(1, 65535)
+    }
+
+    private fun rewriteMediaUrls(raw: String): String {
+        val host = activeMediaHost ?: return raw
+        return runCatching {
+            val root = JSONObject(raw)
+            fun rewrite(objectValue: JSONObject) {
+                listOf("mediaUrl", "backgroundMediaUrl", "url").forEach { key ->
+                    val old = objectValue.optString(key, "")
+                    if (old.contains("/media/")) {
+                        val id = old.substringAfterLast("/media/").substringBefore('?')
+                        if (id.isNotBlank()) {
+                            val urlHost = if (host.contains(':')) "[${host.replace("%", "%25")}]" else host
+                            objectValue.put(key, "http://$urlHost:$activeMediaPort/media/$id")
+                        }
+                    }
+                }
+                objectValue.keys().forEach { key -> objectValue.optJSONObject(key)?.let(::rewrite) }
+            }
+            rewrite(root)
+            root.toString()
+        }.getOrDefault(raw)
     }
 
     private fun recordRecoveryState(type: String, message: String) {
@@ -339,15 +396,26 @@ class WebSocketClientManager(
     }
 
     fun restoreSavedHost() {
-        currentHost?.takeIf { !isConnected && !isConnecting }?.let { connect(it) }
+        currentHost?.takeIf { !isConnected && !isConnecting }?.let { connect(it, currentPort) }
     }
 
     fun isConnectedNow(): Boolean = isConnected
 
     fun close() {
+        slideCommands.close()
         disconnect()
         scope.cancel()
         httpClient.dispatcher.cancelAll()
         httpClient.connectionPool.evictAll()
+    }
+
+    private object TcpNoDelaySocketFactory : SocketFactory() {
+        private val delegate = SocketFactory.getDefault()
+        private fun configure(socket: Socket) = socket.apply { tcpNoDelay = true }
+        override fun createSocket(): Socket = configure(delegate.createSocket())
+        override fun createSocket(host: String, port: Int): Socket = configure(delegate.createSocket(host, port))
+        override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket = configure(delegate.createSocket(host, port, localHost, localPort))
+        override fun createSocket(host: InetAddress, port: Int): Socket = configure(delegate.createSocket(host, port))
+        override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPort: Int): Socket = configure(delegate.createSocket(address, port, localAddress, localPort))
     }
 }

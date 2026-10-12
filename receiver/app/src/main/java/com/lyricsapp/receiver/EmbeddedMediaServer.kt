@@ -6,6 +6,7 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.File
 import java.net.ServerSocket
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URLDecoder
 import java.security.MessageDigest
@@ -15,10 +16,11 @@ import java.util.concurrent.Executors
 class EmbeddedMediaServer(
     private val cacheDir: File,
     private val port: Int = 8766,
-    private val onReady: (id: String, type: String) -> Unit,
+    private val mediaUrlFor: (id: String) -> String?,
+    private val onReady: (id: String, type: String, url: String) -> Unit,
     private val onError: (reason: String) -> Unit = {}
 ) {
-    companion object { private const val TAG = "MediaHttp"; private const val MAX_BYTES = 2L * 1024 * 1024 * 1024 }
+    companion object { private const val TAG = "MediaHttp"; private const val SERVER_TAG = "MediaServer"; private const val MAX_BYTES = 2L * 1024 * 1024 * 1024 }
     private val mimeById = java.util.concurrent.ConcurrentHashMap<String, String>()
     @Volatile private var running = false
     private var socket: ServerSocket? = null
@@ -28,8 +30,13 @@ class EmbeddedMediaServer(
         running = true
         Thread({
             try {
-                val listener = ServerSocket(port)
+                val listener = ServerSocket().apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress("0.0.0.0", port))
+                }
                 socket = listener
+                val advertised = mediaUrlFor("startup-check")
+                Log.i(SERVER_TAG, "HTTP media server bound to 0.0.0.0:$port; reachable URL example=$advertised")
                 while (running) {
                     val client = listener.accept()
                     workers.execute {
@@ -52,6 +59,7 @@ class EmbeddedMediaServer(
             val path = parts.getOrNull(1)?.substringBefore('?') ?: return
             val headers = mutableMapOf<String, String>()
             while (true) { val line = readLine(input) ?: return; if (line.isEmpty()) break; val i = line.indexOf(':'); if (i > 0) headers[line.substring(0, i).trim().lowercase()] = line.substring(i + 1).trim() }
+            Log.d(SERVER_TAG, "$method $path from=${s.remoteSocketAddress} range=${headers["range"] ?: "none"} contentType=${headers["content-type"] ?: "none"}")
             if (method == "POST" && path == "/media") { upload(input, output, headers); return }
             if (method == "GET" && path.startsWith("/media/")) { stream(path.substringAfterLast('/'), headers["range"], output); return }
             respond(output, 404, "Not Found", "text/plain", "Not found".toByteArray())
@@ -78,8 +86,10 @@ class EmbeddedMediaServer(
             val type = if (mime.startsWith("video/")) "VIDEO" else "IMAGE"
             mimeById[id] = mime
             File(cacheDir, "media_$id.mime").writeText(mime)
-            onReady(id, type)
-            val body = """{"mediaId":"$id","url":"/media/$id","type":"$type"}""".toByteArray()
+            val url = mediaUrlFor(id) ?: throw IllegalStateException("Receiver LAN address is unavailable")
+            onReady(id, type, url)
+            val body = """{"mediaId":"$id","url":"$url","type":"$type"}""".toByteArray()
+            Log.i(SERVER_TAG, "POST /media response=201 mediaId=$id type=$type bytes=${file.length()} url=$url")
             respond(out, 201, "Created", "application/json", body)
         } catch (e: Exception) { file.delete(); onError(e.message ?: "Unable to store media"); respond(out, 507, "Upload Failed", "text/plain", (e.message ?: "Unable to store media").toByteArray()) }
     }
@@ -134,6 +144,7 @@ class EmbeddedMediaServer(
         val partial = range != null
         val mime = mimeById[id] ?: File(cacheDir, "media_$id.mime").takeIf { it.isFile }?.readText()?.takeIf { it.startsWith("image/") || it.startsWith("video/") } ?: "application/octet-stream"
         val count = end - start + 1
+        Log.d(SERVER_TAG, "GET /media/$id range=${range ?: "none"} response=${if (partial) 206 else 200} contentType=$mime bytes=$count/$total")
         out.write("HTTP/1.1 ${if (partial) "206 Partial Content" else "200 OK"}\r\nContent-Type: $mime\r\nAccept-Ranges: bytes\r\nContent-Length: $count\r\n${if (partial) "Content-Range: bytes $start-$end/$total\r\n" else ""}Connection: close\r\n\r\n".toByteArray())
         file.inputStream().use { stream -> stream.skip(start); val buf = ByteArray(64 * 1024); var left = count; while (left > 0) { val n = stream.read(buf, 0, minOf(buf.size.toLong(), left).toInt()); if (n < 0) break; out.write(buf, 0, n); left -= n } }
         out.flush()

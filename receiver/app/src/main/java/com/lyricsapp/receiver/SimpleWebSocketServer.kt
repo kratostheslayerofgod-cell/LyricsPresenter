@@ -15,6 +15,9 @@ import org.java_websocket.framing.CloseFrame
 import org.java_websocket.handshake.ClientHandshake
 import org.java_websocket.server.WebSocketServer
 import java.net.InetSocketAddress
+import java.net.InetAddress
+import java.nio.channels.SocketChannel
+import org.java_websocket.WebSocketImpl
 
 /**
  * Stable WebSocket server for the Receiver app.
@@ -54,6 +57,8 @@ class SimpleWebSocketServer(
     @Volatile
     private var active: WebSocket? = null
 
+    @Volatile private var activeLocalAddress: InetAddress? = null
+
     @Volatile
     private var isRunning = false
 
@@ -83,6 +88,7 @@ class SimpleWebSocketServer(
         runCatching { server?.stop(1_000) }
         server = null
         active = null
+        activeLocalAddress = null
         scope.cancel()
     }
 
@@ -101,7 +107,10 @@ class SimpleWebSocketServer(
         }
     }
 
-    private inner class InnerServer : WebSocketServer(InetSocketAddress(port)) {
+    /** Local endpoint selected by the accepted WebSocket route (same interface as control traffic). */
+    fun getActiveLocalHost(): String? = activeLocalAddress?.hostAddress?.takeIf { it.isNotBlank() && !it.startsWith("127.") && it != "::1" }
+
+    private inner class InnerServer : WebSocketServer(InetSocketAddress("0.0.0.0", port)) {
 
         init {
             setReuseAddr(true)
@@ -114,6 +123,12 @@ class SimpleWebSocketServer(
 
         override fun onOpen(conn: WebSocket, handshake: ClientHandshake) {
             Log.d(TAG, "Client handshake complete. Connected to Controller! (${conn.remoteSocketAddress})")
+            runCatching {
+                val channel = (conn as? WebSocketImpl)?.selectionKey?.channel() as? SocketChannel
+                channel?.socket()?.apply { tcpNoDelay = true }
+                activeLocalAddress = channel?.socket()?.localAddress
+                Log.i("MediaServer", "Control socket local interface=${activeLocalAddress?.hostAddress}; media URL host will use this interface")
+            }.onFailure { Log.w(TAG, "Could not optimize accepted socket/interface", it) }
 
             // Single-operator design: a new controller takes over from the old one.
             // Swap [active] FIRST so the old socket's onClose() does not fire
@@ -141,6 +156,7 @@ class SimpleWebSocketServer(
             Log.d(TAG, "Client disconnected: code=$code reason='$reason' remote=$remote")
             if (active === conn) {
                 active = null
+                activeLocalAddress = null
                 onConnectionChanged(false)
             }
         }

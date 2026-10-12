@@ -1,7 +1,10 @@
 package com.lyricsapp.controller
 
 import android.graphics.Typeface
+import android.net.Uri
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -14,24 +17,33 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.lyricsapp.shared.MediaFitMode
+import com.lyricsapp.shared.MediaAsset
 import com.lyricsapp.shared.Template
 import com.lyricsapp.shared.TemplateBackgroundType
 import com.lyricsapp.shared.builtInTemplates
 import java.util.UUID
+import coil.compose.AsyncImage
 
-private enum class TemplateColorTarget { Text, Background, Shadow }
+private enum class TemplateColorTarget { Text, Background, Gradient, Shadow, Outline }
 
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
 fun TemplateManagerScreen(
     templates: List<Template>,
+    mediaAssets: List<MediaAsset> = emptyList(),
     onSave: (Template) -> Unit,
     onDelete: (Template) -> Unit,
     onSetDefault: (Template) -> Unit,
@@ -47,7 +59,7 @@ fun TemplateManagerScreen(
         items(templates, key = { it.id }) { template ->
             Card {
                 Column(Modifier.padding(12.dp)) {
-                    TemplatePreview(template = template, modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f))
+                    TemplatePreview(template = template, mediaAssets = mediaAssets, modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f))
                     Text(template.name + if (template.isDefault) " · Default" else "", fontWeight = FontWeight.Bold)
                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         TextButton(onClick = { onApply(template) }) { Text("Apply") }
@@ -71,7 +83,9 @@ fun TemplateManagerScreen(
         var italic by remember(draft.id) { mutableStateOf(draft.italic) }
         var textColor by remember(draft.id) { mutableStateOf(draft.textColor) }
         var backgroundColor by remember(draft.id) { mutableStateOf(draft.backgroundColor) }
+        var gradientEndColor by remember(draft.id) { mutableStateOf(draft.backgroundGradientEndColor ?: "#FF1E3A8A") }
         var shadowColor by remember(draft.id) { mutableStateOf(draft.shadowColor) }
+        var outlineColor by remember(draft.id) { mutableStateOf(draft.outlineColor) }
         var horizontalAlignment by remember(draft.id) { mutableStateOf(draft.horizontalAlignment) }
         var verticalAlignment by remember(draft.id) { mutableStateOf(draft.verticalAlignment) }
         var lineSpacing by remember(draft.id) { mutableFloatStateOf(draft.lineSpacing) }
@@ -83,10 +97,12 @@ fun TemplateManagerScreen(
         var margin by remember(draft.id) { mutableFloatStateOf(draft.marginDp.toFloat()) }
         var colorTarget by remember(draft.id) { mutableStateOf(TemplateColorTarget.Text) }
         var showPicker by remember(draft.id) { mutableStateOf(false) }
+        var mediaMenuExpanded by remember(draft.id) { mutableStateOf(false) }
+        val previewMedia = mediaAssets.firstOrNull { it.mediaId == backgroundMediaId }
 
         AlertDialog(
             onDismissRequest = { editing = null },
-            title = { Text("Edit template") },
+            title = { Text(if (templates.any { it.id == draft.id }) "Edit template" else "Create template") },
             text = {
                 Column(
                     Modifier.heightIn(max = 560.dp).verticalScroll(rememberScrollState()),
@@ -94,9 +110,23 @@ fun TemplateManagerScreen(
                 ) {
                     Box(
                         Modifier.fillMaxWidth().aspectRatio(16f / 9f)
-                            .background(previewBackground(backgroundType, backgroundColor), RoundedCornerShape(16.dp)),
+                            .background(previewBackground(backgroundType, backgroundColor, gradientEndColor), RoundedCornerShape(16.dp)),
                         contentAlignment = templateAlignment(verticalAlignment)
                     ) {
+                        if (backgroundType == TemplateBackgroundType.IMAGE && previewMedia?.sourceUri != null) {
+                            AsyncImage(
+                                model = Uri.parse(previewMedia.sourceUri),
+                                contentDescription = null,
+                                contentScale = mediaContentScale(fit),
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        } else if (backgroundType == TemplateBackgroundType.VIDEO) {
+                            Surface(Modifier.fillMaxSize(), color = Color.Black.copy(alpha = 0.4f)) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Text(previewMedia?.name ?: "Video background", color = Color.White)
+                                }
+                            }
+                        }
                         if (overlayDim > 0 && backgroundType != TemplateBackgroundType.NONE) {
                             Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = overlayDim / 100f)))
                         }
@@ -110,9 +140,11 @@ fun TemplateManagerScreen(
                             fontStyle = if (italic) FontStyle.Italic else FontStyle.Normal,
                             textAlign = templateTextAlign(horizontalAlignment),
                             lineHeight = (fontSize / 2 * lineSpacing).sp,
+                            style = TextStyle(shadow = shadowColor?.let { Shadow(parseTemplateColor(it), Offset(2f, 2f), 5f) }),
                             maxLines = 3
                         )
                     }
+                    Text("Text size: ${fontSize.toInt()} sp", style = MaterialTheme.typography.labelLarge)
                     OutlinedTextField(name, { name = it }, label = { Text("Template name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
 
                     Text("Font family", style = MaterialTheme.typography.labelLarge)
@@ -129,9 +161,10 @@ fun TemplateManagerScreen(
                         Checkbox(italic, { italic = it }); Text("Italic")
                     }
 
-                    Text("Text color, background and shadow")
+                    Text("Text color (words)")
+                    ColorSwatches(textColor) { color -> textColor = color }
                     Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf("Text" to TemplateColorTarget.Text, "Background" to TemplateColorTarget.Background, "Shadow" to TemplateColorTarget.Shadow).forEach { (label, target) ->
+                        listOf("Custom text…" to TemplateColorTarget.Text, "Shadow…" to TemplateColorTarget.Shadow, "Outline…" to TemplateColorTarget.Outline).forEach { (label, target) ->
                             OutlinedButton(onClick = { colorTarget = target; showPicker = true }) { Text(label) }
                         }
                     }
@@ -151,6 +184,17 @@ fun TemplateManagerScreen(
                     Text("Line spacing: ${"%.2f".format(lineSpacing)}")
                     Slider(lineSpacing, { lineSpacing = it }, valueRange = 1f..2f)
 
+                    Text("Background & media studio")
+                    ColorSwatches(backgroundColor) { color -> backgroundColor = color; backgroundType = TemplateBackgroundType.SOLID }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        OutlinedButton(onClick = { colorTarget = TemplateColorTarget.Background; showPicker = true }) { Text("Custom background color…") }
+                        FilterChip(backgroundType == TemplateBackgroundType.GRADIENT, { backgroundType = TemplateBackgroundType.GRADIENT }, label = { Text("Gradient") })
+                    }
+                    if (backgroundType == TemplateBackgroundType.GRADIENT) {
+                        Text("Gradient end color")
+                        ColorSwatches(gradientEndColor) { gradientEndColor = it }
+                        OutlinedButton(onClick = { colorTarget = TemplateColorTarget.Gradient; showPicker = true }) { Text("Custom gradient color…") }
+                    }
                     Text("Background type")
                     Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         TemplateBackgroundType.entries.forEach { type ->
@@ -158,14 +202,28 @@ fun TemplateManagerScreen(
                         }
                     }
                     if (backgroundType == TemplateBackgroundType.IMAGE || backgroundType == TemplateBackgroundType.VIDEO) {
-                        OutlinedTextField(
-                            value = backgroundMediaId,
-                            onValueChange = { backgroundMediaId = it },
-                            label = { Text("Background media ID") },
-                            placeholder = { Text("Choose an imported media ID") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
-                        )
+                        val matchingMedia = mediaAssets.filter { asset ->
+                            if (backgroundType == TemplateBackgroundType.IMAGE) asset.type.equals("IMAGE", true) || asset.type.equals("PHOTO", true)
+                            else asset.type.equals("VIDEO", true)
+                        }
+                        ExposedDropdownMenuBox(expanded = mediaMenuExpanded, onExpandedChange = { mediaMenuExpanded = it }) {
+                            OutlinedTextField(
+                                value = matchingMedia.firstOrNull { it.mediaId == backgroundMediaId }?.name
+                                    ?: backgroundMediaId.ifBlank { "Choose imported ${backgroundType.name.lowercase()}" },
+                                onValueChange = {}, readOnly = true, label = { Text("Background media") },
+                                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(mediaMenuExpanded) },
+                                modifier = Modifier.fillMaxWidth().menuAnchor()
+                            )
+                            ExposedDropdownMenu(expanded = mediaMenuExpanded, onDismissRequest = { mediaMenuExpanded = false }) {
+                                matchingMedia.forEach { asset ->
+                                    DropdownMenuItem(text = { Text(asset.name) }, onClick = {
+                                        backgroundMediaId = asset.mediaId
+                                        mediaMenuExpanded = false
+                                    })
+                                }
+                                if (matchingMedia.isEmpty()) DropdownMenuItem(text = { Text("No matching media imported") }, onClick = { mediaMenuExpanded = false })
+                            }
+                        }
                     }
                     Text("Media fit")
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -190,12 +248,14 @@ fun TemplateManagerScreen(
                         bold = bold,
                         italic = italic,
                         textColor = textColor,
+                        outlineColor = outlineColor,
                         horizontalAlignment = horizontalAlignment,
                         verticalAlignment = verticalAlignment,
                         lineSpacing = lineSpacing,
                         shadowColor = shadowColor,
                         backgroundType = backgroundType,
                         backgroundColor = backgroundColor,
+                        backgroundGradientEndColor = gradientEndColor.takeIf { backgroundType == TemplateBackgroundType.GRADIENT },
                         backgroundMediaId = backgroundMediaId.ifBlank { null },
                         mediaFitMode = fit,
                         overlayDimPercent = overlayDim.toInt(),
@@ -213,7 +273,9 @@ fun TemplateManagerScreen(
             val selected = when (colorTarget) {
                 TemplateColorTarget.Text -> textColor
                 TemplateColorTarget.Background -> backgroundColor
+                TemplateColorTarget.Gradient -> gradientEndColor
                 TemplateColorTarget.Shadow -> shadowColor ?: "#FF000000"
+                TemplateColorTarget.Outline -> outlineColor ?: "#FFFFFFFF"
             }
             ColorPickerDialog(
                 initialColor = parseTemplateColor(selected).value.toLong().toInt(),
@@ -223,7 +285,9 @@ fun TemplateManagerScreen(
                     when (colorTarget) {
                         TemplateColorTarget.Text -> textColor = hex
                         TemplateColorTarget.Background -> backgroundColor = hex
+                        TemplateColorTarget.Gradient -> gradientEndColor = hex
                         TemplateColorTarget.Shadow -> shadowColor = hex
+                        TemplateColorTarget.Outline -> outlineColor = hex
                     }
                     showPicker = false
                 }
@@ -233,8 +297,20 @@ fun TemplateManagerScreen(
 }
 
 @Composable
-private fun TemplatePreview(template: Template, modifier: Modifier = Modifier) {
-    Box(modifier.background(previewBackground(template.backgroundType, template.backgroundColor), RoundedCornerShape(8.dp)), contentAlignment = templateAlignment(template.verticalAlignment)) {
+private fun TemplatePreview(template: Template, mediaAssets: List<MediaAsset>, modifier: Modifier = Modifier) {
+    val media = mediaAssets.firstOrNull { it.mediaId == template.backgroundMediaId }
+    Box(modifier.background(previewBackground(template.backgroundType, template.backgroundColor, template.backgroundGradientEndColor), RoundedCornerShape(8.dp)), contentAlignment = templateAlignment(template.verticalAlignment)) {
+        if (template.backgroundType == TemplateBackgroundType.IMAGE && media?.sourceUri != null) {
+            AsyncImage(Uri.parse(media.sourceUri), contentDescription = null, contentScale = mediaContentScale(template.mediaFitMode), modifier = Modifier.fillMaxSize())
+        }
+        if (template.backgroundType == TemplateBackgroundType.VIDEO) {
+            Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)), contentAlignment = Alignment.Center) {
+                Text(media?.name ?: "Video background", color = Color.White)
+            }
+        }
+        if (template.overlayDimPercent > 0 && template.backgroundType != TemplateBackgroundType.NONE) {
+            Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = template.overlayDimPercent.coerceIn(0, 100) / 100f)))
+        }
         Text(
             "Amazing grace, how sweet the sound",
             modifier = Modifier.fillMaxWidth().padding(template.paddingDp.dp.coerceAtMost(48.dp)),
@@ -245,13 +321,38 @@ private fun TemplatePreview(template: Template, modifier: Modifier = Modifier) {
             fontStyle = if (template.italic) FontStyle.Italic else FontStyle.Normal,
             textAlign = templateTextAlign(template.horizontalAlignment),
             lineHeight = (template.fontSize / 2f * template.lineSpacing).sp,
+            style = TextStyle(shadow = template.shadowColor?.let { Shadow(parseTemplateColor(it), Offset(2f, 2f), 5f) }),
             maxLines = 3
         )
     }
 }
 
-private fun previewBackground(type: TemplateBackgroundType, color: String): Color =
-    if (type == TemplateBackgroundType.SOLID) parseTemplateColor(color) else Color(0xFF10131C)
+private fun previewBackground(type: TemplateBackgroundType, color: String, endColor: String? = null): Brush = when (type) {
+    TemplateBackgroundType.SOLID -> SolidColor(parseTemplateColor(color))
+    TemplateBackgroundType.GRADIENT -> Brush.linearGradient(listOf(parseTemplateColor(color), parseTemplateColor(endColor ?: "#FF1E3A8A")))
+    TemplateBackgroundType.NONE -> SolidColor(Color.Black)
+    else -> SolidColor(Color(0xFF10131C))
+}
+
+@Composable
+private fun ColorSwatches(selected: String, onSelect: (String) -> Unit) {
+    val colors = listOf("#FF00BCD4", "#FF29B6F6", "#FFFFFFFF", "#FFFFFF00", "#FF000000", "#FF1E3A8A", "#FF2563EB", "#FF111827")
+    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        colors.forEach { hex ->
+            Box(
+                Modifier.size(38.dp).background(parseTemplateColor(hex), RoundedCornerShape(50))
+                    .border(if (hex.equals(selected, true)) 3.dp else 1.dp, if (hex.equals(selected, true)) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.7f), RoundedCornerShape(50))
+                    .clickable { onSelect(hex) }
+            )
+        }
+    }
+}
+
+private fun mediaContentScale(mode: MediaFitMode): ContentScale = when (mode) {
+    MediaFitMode.FIT -> ContentScale.Fit
+    MediaFitMode.STRETCH -> ContentScale.FillBounds
+    MediaFitMode.FILL -> ContentScale.Crop
+}
 
 private fun templateAlignment(vertical: String): Alignment = when (vertical.lowercase()) {
     "top" -> Alignment.TopCenter

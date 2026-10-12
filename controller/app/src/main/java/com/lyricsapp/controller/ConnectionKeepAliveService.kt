@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Binder
 import android.os.IBinder
 import android.os.PowerManager
+import android.net.wifi.WifiManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -55,6 +56,7 @@ class ConnectionKeepAliveService : Service() {
     lateinit var webSocketClient: WebSocketClientManager
         private set
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -73,6 +75,7 @@ class ConnectionKeepAliveService : Service() {
                 try {
                     val message = org.json.JSONObject(raw)
                     if (message.optString("type") == "ACK" && message.optString("receivedMessageType") == "HANDSHAKE" && message.optBoolean("success")) {
+                        webSocketClient.setMediaEndpoint(message.optString("mediaHost").takeIf { it.isNotBlank() }, message.optInt("mediaPort", 8766))
                         webSocketClient.restoreLastState()
                     }
                     _incomingMessages.emit(raw)
@@ -80,7 +83,10 @@ class ConnectionKeepAliveService : Service() {
                     Log.w(TAG, "Ignoring invalid receiver message", error)
                 }
             },
-            onConnectionChanged = { connected -> _connectionState.value = connected },
+            onConnectionChanged = { connected ->
+                _connectionState.value = connected
+                if (connected) acquireWifiLock() else releaseWifiLock()
+            },
             onRepeatedDisconnects = { _repeatedDisconnects.value = _repeatedDisconnects.value + 1 }
         )
     }
@@ -96,7 +102,23 @@ class ConnectionKeepAliveService : Service() {
         try { webSocketClient.close() } catch (error: Exception) { Log.w(TAG, "Socket shutdown failed", error) }
         try { wakeLock?.takeIf { it.isHeld }?.release() } catch (error: Exception) { Log.w(TAG, "Wake lock release failed", error) }
         wakeLock = null
+        releaseWifiLock()
         super.onDestroy()
+    }
+
+    private fun acquireWifiLock() {
+        try {
+            if (wifiLock?.isHeld == true) return
+            val manager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+            wifiLock = manager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "$packageName:PresentationWifi")
+                .apply { setReferenceCounted(false); acquire() }
+        } catch (error: Exception) { Log.w(TAG, "Could not acquire Wi-Fi lock", error) }
+    }
+
+    private fun releaseWifiLock() {
+        try { wifiLock?.takeIf { it.isHeld }?.release() }
+        catch (error: Exception) { Log.w(TAG, "Could not release Wi-Fi lock", error) }
+        wifiLock = null
     }
 
     private fun createNotificationChannel() {

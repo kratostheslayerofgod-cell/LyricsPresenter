@@ -114,13 +114,14 @@ data class AppMessage(
     @StringRes val actionLabel: Int? = null,
     val action: AppMessageAction = AppMessageAction.None,
     val severity: MessageSeverity = MessageSeverity.Info,
-    val id: Long = System.nanoTime()
+    val id: Long = System.nanoTime(),
+    val details: String? = null
 )
 
 @Composable
 fun AppMessageHost(message: AppMessage?, modifier: Modifier = Modifier, onDismiss: () -> Unit, onAction: (AppMessageAction) -> Unit) {
     LaunchedEffect(message?.id) {
-        if (message != null) { delay(5_000); onDismiss() }
+        if (message != null) { delay(1_000); onDismiss() }
     }
     AnimatedVisibility(
         modifier = modifier,
@@ -146,6 +147,7 @@ fun AppMessageHost(message: AppMessage?, modifier: Modifier = Modifier, onDismis
                 Column(Modifier.weight(1f)) {
                     Text(stringResource(current.title), color = SpatialColors.TextPrimary, style = MaterialTheme.typography.titleSmall)
                     Text(stringResource(current.cause), color = SpatialColors.TextSecondary, style = MaterialTheme.typography.bodySmall)
+                    current.details?.takeIf { it.isNotBlank() }?.let { Text(it, color = SpatialColors.TextSecondary, style = MaterialTheme.typography.labelSmall) }
                 }
                 current.actionLabel?.let { label ->
                     Spacer(Modifier.width(8.dp))

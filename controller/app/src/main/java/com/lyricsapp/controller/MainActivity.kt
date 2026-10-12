@@ -12,6 +12,7 @@ import android.content.ServiceConnection
 import android.provider.Settings
 import android.os.IBinder
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -56,6 +57,7 @@ import androidx.lifecycle.lifecycleScope
 import coil.compose.AsyncImage
 import com.lyricsapp.controller.data.DatabaseProvider
 import com.lyricsapp.controller.data.SongRepository
+import com.lyricsapp.controller.data.SongFolder
 import com.lyricsapp.controller.data.PresenterPreferences
 import com.lyricsapp.shared.*
 import kotlinx.coroutines.Dispatchers
@@ -118,21 +120,23 @@ class MainActivity : ComponentActivity() {
     private var boundControlService: ConnectionKeepAliveService? = null
     private var serviceBound = false
     private var pendingConnectHost: String? = null
+    private var pendingConnectPort: Int = 8765
     private var serviceReady: ((ConnectionKeepAliveService) -> Unit)? = null
     private val controlServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val service = (binder as? ConnectionKeepAliveService.LocalBinder)?.service() ?: return
             boundControlService = service
             serviceReady?.invoke(service)
-            pendingConnectHost?.also { pendingConnectHost = null; service.webSocketClient.connect(it) }
+            pendingConnectHost?.also { pendingConnectHost = null; service.webSocketClient.connect(it, pendingConnectPort) }
         }
         override fun onServiceDisconnected(name: ComponentName?) { boundControlService = null }
     }
 
-    private fun connectReceiver(host: String) {
+    private fun connectReceiver(host: String, port: Int = 8765) {
         pendingConnectHost = host
+        pendingConnectPort = port
         ConnectionKeepAliveService.start(applicationContext, restoreSavedConnection = false)
-        boundControlService?.webSocketClient?.connect(host)
+        boundControlService?.webSocketClient?.connect(host, port)
         if (boundControlService != null) pendingConnectHost = null
     }
 
@@ -146,6 +150,12 @@ class MainActivity : ComponentActivity() {
         
         songRepository = SongRepository(DatabaseProvider.get(applicationContext))
         val presenterPreferences = PresenterPreferences(applicationContext)
+        val pendingSlideNavigation = LinkedHashMap<Long, Pair<Int, Int>>()
+        var lastSlideCommandTimestamp = 0L
+        val nextSlideCommandTimestamp = {
+            val now = System.currentTimeMillis()
+            maxOf(now, lastSlideCommandTimestamp + 1L).also { lastSlideCommandTimestamp = it }
+        }
         var templates by mutableStateOf(builtInTemplates())
         var mediaAssets by mutableStateOf(emptyList<MediaAsset>())
         lifecycleScope.launch(Dispatchers.IO) {
@@ -161,6 +171,7 @@ class MainActivity : ComponentActivity() {
         var connectionStatus by mutableStateOf("Disconnected")
         var receiverScreenState by mutableStateOf("BLANK")
         var receiverMediaPort by mutableIntStateOf(8766)
+        var receiverMediaHost by mutableStateOf<String?>(null)
         var receiverScreenWidthDp by mutableIntStateOf(1920)
         var appMessage by mutableStateOf<AppMessage?>(null)
         var wasConnected by mutableStateOf(false)
@@ -175,6 +186,7 @@ class MainActivity : ComponentActivity() {
         
         // Observe Room DB songs
         val savedSongsFlow = songRepository.observeSongs()
+        val savedFoldersFlow = songRepository.observeFolders()
         
         // Seed default songs if database is empty
         lifecycleScope.launch(Dispatchers.IO) {
@@ -189,21 +201,59 @@ class MainActivity : ComponentActivity() {
 
         serviceReady = { service ->
             wsClient = service.webSocketClient
+            lifecycleScope.launch(Dispatchers.IO) {
+                val remembered = presenterPreferences.lastReceiver.first()
+                if (remembered != null) withContext(Dispatchers.Main) {
+                    if (pendingConnectHost == null && !service.webSocketClient.isConnectedNow()) {
+                        connectedDeviceHost = remembered.host
+                        connectedDeviceName = remembered.name
+                        receiverMediaHost = remembered.host
+                        connectionStatus = "Connecting to ${remembered.name} (${remembered.host})..."
+                        service.webSocketClient.connect(remembered.host, remembered.port)
+                    }
+                }
+            }
             lifecycleScope.launch {
                 service.incomingMessages.collectLatest { message ->
                 runCatching {
                     val incoming = JSONObject(message)
-                    if (incoming.optString("receivedMessageType") == "HANDSHAKE") receiverMediaPort = incoming.optInt("mediaPort", 8766)
+                    if (incoming.optString("receivedMessageType") == "HANDSHAKE") {
+                        receiverMediaPort = incoming.optInt("mediaPort", 8766)
+                        receiverMediaHost = incoming.optString("mediaHost").takeIf { it.isNotBlank() }
+                    }
                     if (incoming.optString("receivedMessageType") == "HANDSHAKE") receiverScreenWidthDp = incoming.optInt("screenWidthDp", receiverScreenWidthDp).coerceAtLeast(1)
                     when (incoming.optString("type")) {
                         "ACK" -> {
                             receiverScreenState = incoming.optString("screenState", receiverScreenState)
                             val command = incoming.optString("receivedMessageType")
-                            appMessage = if (incoming.optBoolean("success", true)) AppMessages.success(applicationContext, command)
-                            else AppMessages.failedAck(command, incoming.optString("error").takeIf { it.isNotBlank() })
+                            if (command in setOf("NEXT_SLIDE", "PREV_SLIDE", "JUMP_SLIDE")) {
+                                val commandTimestamp = incoming.optLong("commandTimestamp", 0L)
+                                val navigation = pendingSlideNavigation.remove(commandTimestamp)
+                                if (!incoming.optBoolean("success", true) && navigation != null && activeSlideIndex == navigation.second) {
+                                    activeSlideIndex = navigation.first
+                                    Log.w("SlideLatency", "Navigation rolled back after failed ACK command=$command")
+                                } else if (incoming.optBoolean("success", true) && navigation != null && activeSlideIndex == navigation.second) {
+                                    activeSlideIndex = incoming.optInt("currentSlide", navigation.second)
+                                }
+                                while (pendingSlideNavigation.size > 64) pendingSlideNavigation.remove(pendingSlideNavigation.keys.first())
+                                if (commandTimestamp > 0) Log.d("SlideLatency", "command=$command ackRoundTripMs=${(System.currentTimeMillis() - commandTimestamp).coerceAtLeast(0L)}")
+                            }
+                            if (!incoming.optBoolean("success", true)) appMessage = AppMessages.failedAck(command, incoming.optString("error").takeIf { it.isNotBlank() }).let { failure ->
+                                if (command == "SET_BACKGROUND") {
+                                    val mediaId = incoming.optString("mediaId").takeIf { it.isNotBlank() } ?: activeSong?.displaySettings?.backgroundMediaId
+                                    failure.copy(details = mediaId?.let { buildReceiverMediaUrl(receiverMediaHost ?: connectedDeviceHost, receiverMediaPort, it) })
+                                } else failure
+                            } else if (command == "HANDSHAKE") {
+                                appMessage = AppMessages.success(applicationContext, command)
+                            }
                         }
-                        "MEDIA_ERROR" -> appMessage = AppMessages.mediaFailure(incoming.optString("reason", ""))
-                        "MEDIA_READY" -> appMessage = AppMessage(R.string.msg_media_ready, R.string.msg_media_ready_cause, severity = MessageSeverity.Success)
+                        "MEDIA_ERROR" -> {
+                            val mediaId = incoming.optString("mediaId", "")
+                            val failedUrl = if (mediaId.isNotBlank()) buildReceiverMediaUrl(receiverMediaHost ?: connectedDeviceHost, receiverMediaPort, mediaId)
+                            else receiverMediaHost?.let { "http://${formatHttpHost(it)}:$receiverMediaPort/media" }
+                            appMessage = AppMessages.mediaFailure(incoming.optString("reason", "")).copy(details = failedUrl)
+                        }
+                        "MEDIA_READY" -> Unit
                     }
                 }.onFailure { error ->
                     Log.w("MainActivity", "Could not read receiver message", error)
@@ -242,10 +292,19 @@ class MainActivity : ComponentActivity() {
             discoveredReceivers.clear()
             discoveredReceivers.addAll(list)
             isSearching = false
+            val rememberedDevice = connectedDeviceName?.let { name -> list.firstOrNull { it.name == name && it.host != connectedDeviceHost } }
+            if (!isConnected && rememberedDevice != null) {
+                connectedDeviceHost = rememberedDevice.host
+                connectionStatus = "Connecting to ${rememberedDevice.name} (${rememberedDevice.host})..."
+                receiverMediaHost = rememberedDevice.host
+                lifecycleScope.launch(Dispatchers.IO) { presenterPreferences.saveReceiver(rememberedDevice.host, rememberedDevice.port, rememberedDevice.name) }
+                connectReceiver(rememberedDevice.host, rememberedDevice.port)
+            }
         }
 
         setContent {
             val savedSongs by savedSongsFlow.collectAsState(initial = emptyList())
+            val savedFolders by savedFoldersFlow.collectAsState(initial = emptyList())
             var isImportingSongs by remember { mutableStateOf(false) }
             var showImportTemplateDialog by remember { mutableStateOf(false) }
             var pendingTxtUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
@@ -313,7 +372,6 @@ class MainActivity : ComponentActivity() {
                                 }
                                 withContext(Dispatchers.Main) {
                                     isImportingSongs = false
-                                    appMessage = AppMessage(R.string.msg_import_complete, R.string.msg_import_complete_cause, severity = MessageSeverity.Success)
                                 }
                             }
                         }) { Text("Import ${pendingTxtUris.size} songs") }
@@ -438,11 +496,13 @@ class MainActivity : ComponentActivity() {
                                         isSearching = true
                                         discoveryManager.startDiscovery()
                                     },
-                                    onConnectDevice = { name, host ->
+                                    onConnectDevice = { name, host, port ->
                                         connectedDeviceName = name
                                         connectedDeviceHost = host
                                         connectionStatus = "Connecting to $name ($host)..."
-                                        connectReceiver(host)
+                                        receiverMediaHost = host
+                                        lifecycleScope.launch(Dispatchers.IO) { presenterPreferences.saveReceiver(host, port, name) }
+                                        connectReceiver(host, port)
                                     },
                                     onDisconnectDevice = {
                                         if (::wsClient.isInitialized) wsClient.disconnect()
@@ -462,10 +522,13 @@ class MainActivity : ComponentActivity() {
                                     screenState = receiverScreenState,
                                     availableTemplates = templates,
                                     onSelectSlide = { slideIndex ->
-                                        activeSlideIndex = slideIndex
                                         activeSong?.let { song ->
                                             if (isConnected && ::wsClient.isInitialized && slideIndex in song.slides.indices) {
-                                                sendSongDisplayMessage(wsClient, song, slideIndex, connectedDeviceHost, receiverMediaPort)
+                                                val previous = activeSlideIndex
+                                                activeSlideIndex = slideIndex
+                                                val timestamp = nextSlideCommandTimestamp()
+                                                pendingSlideNavigation[timestamp] = previous to slideIndex
+                                                wsClient.sendSlideCommand("JUMP_SLIDE", slideIndex, timestamp)
                                             }
                                         }
                                     },
@@ -475,20 +538,28 @@ class MainActivity : ComponentActivity() {
                                             songRepository.saveSong(updatedSong)
                                         }
                                         if (isConnected && ::wsClient.isInitialized) {
-                                            sendSongDisplayMessage(wsClient, updatedSong, activeSlideIndex.coerceIn(0, maxOf(0, updatedSong.slides.size - 1)), connectedDeviceHost, receiverMediaPort)
+                                            sendSongDisplayMessage(wsClient, updatedSong, activeSlideIndex.coerceIn(0, maxOf(0, updatedSong.slides.size - 1)), receiverMediaHost ?: connectedDeviceHost, receiverMediaPort)
                                         }
                                     },
                                     onNextSlide = {
                                         activeSong?.slides?.takeIf { it.isNotEmpty() }?.let { slides ->
-                                            activeSlideIndex = (activeSlideIndex + 1).coerceAtMost(slides.lastIndex)
+                                            val previous = activeSlideIndex.coerceIn(0, slides.lastIndex)
+                                            val target = (previous + 1).coerceAtMost(slides.lastIndex)
+                                            activeSlideIndex = target
+                                            val timestamp = nextSlideCommandTimestamp()
+                                            pendingSlideNavigation[timestamp] = previous to target
+                                            if (::wsClient.isInitialized) wsClient.sendSlideCommand("NEXT_SLIDE", timestamp = timestamp)
                                         }
-                                        sendToReceiver("""{"type":"NEXT_SLIDE","timestamp":${System.currentTimeMillis()}}""")
                                     },
                                     onPrevSlide = {
                                         activeSong?.slides?.takeIf { it.isNotEmpty() }?.let { slides ->
-                                            activeSlideIndex = (activeSlideIndex - 1).coerceIn(slides.indices)
+                                            val previous = activeSlideIndex.coerceIn(0, slides.lastIndex)
+                                            val target = (previous - 1).coerceAtLeast(0)
+                                            activeSlideIndex = target
+                                            val timestamp = nextSlideCommandTimestamp()
+                                            pendingSlideNavigation[timestamp] = previous to target
+                                            if (::wsClient.isInitialized) wsClient.sendSlideCommand("PREV_SLIDE", timestamp = timestamp)
                                         }
-                                        sendToReceiver("""{"type":"PREV_SLIDE","timestamp":${System.currentTimeMillis()}}""")
                                     },
                                     onBlackScreen = {
                                         sendToReceiver("""{"type":"BLACK_SCREEN","timestamp":${System.currentTimeMillis()}}""")
@@ -504,13 +575,13 @@ class MainActivity : ComponentActivity() {
                                         val id = activeSong?.displaySettings?.backgroundMediaId
                                         if (!id.isNullOrBlank()) {
                                             sendToReceiver("""{"type":"CLEAR_LYRICS","timestamp":${System.currentTimeMillis()}}""")
-                                            activeSong?.let { song -> sendToReceiver(backgroundCommand(id, song.displaySettings.backgroundType, connectedDeviceHost, receiverMediaPort)) }
+                                            activeSong?.let { song -> sendToReceiver(backgroundCommand(id, song.displaySettings.backgroundType, receiverMediaHost ?: connectedDeviceHost, receiverMediaPort)) }
                                         }
                                     },
                                     onBackgroundWithLyrics = {
                                         val id = activeSong?.displaySettings?.backgroundMediaId
-                                        activeSong?.takeIf { ::wsClient.isInitialized }?.let { song -> sendSongDisplayMessage(wsClient, song, activeSlideIndex, connectedDeviceHost, receiverMediaPort) }
-                                        if (!id.isNullOrBlank()) activeSong?.let { song -> sendToReceiver(backgroundCommand(id, song.displaySettings.backgroundType, connectedDeviceHost, receiverMediaPort)) }
+                                        activeSong?.takeIf { ::wsClient.isInitialized }?.let { song -> sendSongDisplayMessage(wsClient, song, activeSlideIndex, receiverMediaHost ?: connectedDeviceHost, receiverMediaPort) }
+                                        if (!id.isNullOrBlank()) activeSong?.let { song -> sendToReceiver(backgroundCommand(id, song.displaySettings.backgroundType, receiverMediaHost ?: connectedDeviceHost, receiverMediaPort)) }
                                     },
                                     onVideoControl = { command, enabled -> sendToReceiver("""{"type":"$command","enabled":$enabled,"timestamp":${System.currentTimeMillis()}}""") },
                                     onApplyTemplate = { template ->
@@ -519,9 +590,11 @@ class MainActivity : ComponentActivity() {
                                             put("fontFamily", template.fontFamily); put("fontSize", template.fontSize); put("bold", template.bold); put("italic", template.italic)
                                             put("textColor", template.textColor); put("horizontalAlignment", template.horizontalAlignment); put("verticalAlignment", template.verticalAlignment)
                                             put("lineSpacing", template.lineSpacing); put("backgroundType", template.backgroundType.name); put("backgroundColor", template.backgroundColor)
+                                            template.backgroundGradientEndColor?.let { put("backgroundGradientEndColor", it) }
+                                            template.outlineColor?.let { put("outlineColor", it) }
                                             put("backgroundMediaId", template.backgroundMediaId); put("mediaFitMode", template.mediaFitMode.name); put("overlayDimPercent", template.overlayDimPercent)
                                             put("paddingDp", template.paddingDp); put("marginDp", template.marginDp)
-                                            template.backgroundMediaId?.let { id -> buildReceiverMediaUrl(connectedDeviceHost, receiverMediaPort, id)?.let { put("backgroundMediaUrl", it) } }
+                                            template.backgroundMediaId?.let { id -> buildReceiverMediaUrl(receiverMediaHost ?: connectedDeviceHost, receiverMediaPort, id)?.let { put("backgroundMediaUrl", it) } }
                                         }
                                         sendToReceiver(JSONObject().put("type", "APPLY_TEMPLATE").put("template", payload).put("timestamp", System.currentTimeMillis()).toString())
                                     }
@@ -530,13 +603,14 @@ class MainActivity : ComponentActivity() {
                             ControllerTab.LIBRARY -> {
                                 SongLibraryScreen(
                                     songs = savedSongs,
+                                    folders = savedFolders,
                                     activeSong = activeSong,
                                     onSelectSong = { song ->
                                         activeSong = song
                                         activeSlideIndex = 0
                                         selectedTab = ControllerTab.LIVE
                                         if (isConnected && ::wsClient.isInitialized) {
-                                            sendSongDisplayMessage(wsClient, song, 0, connectedDeviceHost, receiverMediaPort)
+                                            sendSongDisplayMessage(wsClient, song, 0, receiverMediaHost ?: connectedDeviceHost, receiverMediaPort)
                                         }
                                     },
                                     onEditSong = { song ->
@@ -546,6 +620,26 @@ class MainActivity : ComponentActivity() {
                                     onDeleteSong = { song ->
                                         lifecycleScope.launch(Dispatchers.IO) {
                                             songRepository.deleteSong(song)
+                                        }
+                                    },
+                                    onMoveSong = { song, folderId ->
+                                        lifecycleScope.launch(Dispatchers.IO) {
+                                            songRepository.moveSongToFolder(song, folderId)
+                                        }
+                                    },
+                                    onCreateFolder = { name ->
+                                        lifecycleScope.launch(Dispatchers.IO) {
+                                            songRepository.createFolder(name)
+                                        }
+                                    },
+                                    onRenameFolder = { folder, name ->
+                                        lifecycleScope.launch(Dispatchers.IO) {
+                                            songRepository.renameFolder(folder, name)
+                                        }
+                                    },
+                                    onDeleteFolder = { folder ->
+                                        lifecycleScope.launch(Dispatchers.IO) {
+                                            songRepository.deleteFolder(folder)
                                         }
                                     },
                                     onCreateNew = {
@@ -560,7 +654,7 @@ class MainActivity : ComponentActivity() {
                             ControllerTab.CREATOR -> {
                                 FreeShowCreatorScreen(
                                     existingSong = editingSong,
-                                    mediaHost = connectedDeviceHost,
+                                    mediaHost = receiverMediaHost ?: connectedDeviceHost,
                                     mediaPort = receiverMediaPort,
                                     receiverWidthDp = receiverScreenWidthDp,
                                     availableTemplates = templates,
@@ -576,22 +670,24 @@ class MainActivity : ComponentActivity() {
                                             sendToReceiver(update.toString())
                                         }
                                     },
-                                    onMessage = { appMessage = it },
+                                    onMessage = { if (it.severity != MessageSeverity.Success) appMessage = it },
                                     onSaveSong = { newSong ->
+                                        val savedSong = newSong.copy(folderId = editingSong?.folderId ?: newSong.folderId)
                                         lifecycleScope.launch(Dispatchers.IO) {
-                                            songRepository.saveSong(newSong)
+                                            songRepository.saveSong(savedSong)
                                         }
-                                        activeSong = newSong
+                                        activeSong = savedSong
                                         activeSlideIndex = 0
                                         selectedTab = ControllerTab.LIVE
                                         if (isConnected && ::wsClient.isInitialized) {
-                                            sendSongDisplayMessage(wsClient, newSong, 0, connectedDeviceHost, receiverMediaPort)
+                                            sendSongDisplayMessage(wsClient, savedSong, 0, receiverMediaHost ?: connectedDeviceHost, receiverMediaPort)
                                         }
                                     }
                                 )
                             }
                             ControllerTab.TEMPLATES -> TemplateManagerScreen(
                                 templates = templates,
+                                mediaAssets = mediaAssets,
                                 onSave = { template ->
                                     val updated = if (templates.any { it.id == template.id }) templates.map { if (it.id == template.id) template else it } else templates + template
                                     templates = updated
@@ -608,7 +704,7 @@ class MainActivity : ComponentActivity() {
                                     lifecycleScope.launch(Dispatchers.IO) { presenterPreferences.saveTemplates(updated) }
                                 },
                                 onApply = { template ->
-                                    if (::wsClient.isInitialized) sendTemplateMessage(wsClient, template, connectedDeviceHost, receiverMediaPort)
+                                    if (::wsClient.isInitialized) sendTemplateMessage(wsClient, template, receiverMediaHost ?: connectedDeviceHost, receiverMediaPort)
                                     activeSong?.let { song ->
                                         val style = song.displaySettings.copy(
                                             fontFamily = template.fontFamily, fontSize = template.fontSize,
@@ -618,7 +714,8 @@ class MainActivity : ComponentActivity() {
                                             lineSpacing = template.lineSpacing, shadowColor = template.shadowColor,
                                             backgroundAlpha = 255 - (template.overlayDimPercent.coerceIn(0, 100) * 255 / 100),
                                             backgroundMediaId = template.backgroundMediaId, mediaFitMode = template.mediaFitMode,
-                                            templateId = template.id, paddingDp = template.paddingDp
+                                            templateId = template.id, paddingDp = template.paddingDp,
+                                            backgroundGradientEndColor = template.backgroundGradientEndColor
                                         )
                                         val updated = song.copy(displaySettings = style, updatedAt = System.currentTimeMillis())
                                         activeSong = updated
@@ -628,18 +725,18 @@ class MainActivity : ComponentActivity() {
                             )
                             ControllerTab.MEDIA -> MediaLibraryScreen(
                                 assets = mediaAssets,
-                                mediaHost = connectedDeviceHost,
+                                mediaHost = receiverMediaHost ?: connectedDeviceHost,
                                 mediaPort = receiverMediaPort,
                                 onImported = { asset ->
                                     val updated = (mediaAssets.filterNot { it.mediaId == asset.mediaId } + asset)
                                     mediaAssets = updated
                                     lifecycleScope.launch(Dispatchers.IO) { presenterPreferences.saveMedia(updated) }
                                 },
-                                onMessage = { appMessage = it },
+                                onMessage = { if (it.severity != MessageSeverity.Success) appMessage = it },
                                 onSetBackground = { asset, showLyrics ->
-                                    if (showLyrics && ::wsClient.isInitialized) activeSong?.let { song -> sendSongDisplayMessage(wsClient, song, activeSlideIndex.coerceIn(0, maxOf(0, song.slides.lastIndex)), connectedDeviceHost, receiverMediaPort) }
+                                    if (showLyrics && ::wsClient.isInitialized) activeSong?.let { song -> sendSongDisplayMessage(wsClient, song, activeSlideIndex.coerceIn(0, maxOf(0, song.slides.lastIndex)), receiverMediaHost ?: connectedDeviceHost, receiverMediaPort) }
                                     else sendToReceiver("""{"type":"CLEAR_LYRICS","timestamp":${System.currentTimeMillis()}}""")
-                                    sendToReceiver(backgroundCommand(asset.mediaId, asset.type, connectedDeviceHost, receiverMediaPort))
+                                    sendToReceiver(backgroundCommand(asset.mediaId, asset.type, receiverMediaHost ?: connectedDeviceHost, receiverMediaPort))
                                 }
                             )
                         }
@@ -791,6 +888,8 @@ class MainActivity : ComponentActivity() {
             put("fontFamily", template.fontFamily); put("fontSize", template.fontSize); put("bold", template.bold); put("italic", template.italic)
             put("textColor", template.textColor); put("horizontalAlignment", template.horizontalAlignment); put("verticalAlignment", template.verticalAlignment)
             put("lineSpacing", template.lineSpacing); put("backgroundType", template.backgroundType.name); put("backgroundColor", template.backgroundColor)
+            template.backgroundGradientEndColor?.let { put("backgroundGradientEndColor", it) }
+            template.outlineColor?.let { put("outlineColor", it) }
             put("backgroundMediaId", template.backgroundMediaId); put("mediaFitMode", template.mediaFitMode.name); put("overlayDimPercent", template.overlayDimPercent)
             put("paddingDp", template.paddingDp); put("marginDp", template.marginDp)
             template.backgroundMediaId?.let { id -> buildReceiverMediaUrl(receiverHost, mediaPort, id)?.let { put("backgroundMediaUrl", it) } }
@@ -870,7 +969,7 @@ fun ConnectionScreen(
     discoveredReceivers: List<DiscoveryManager.DiscoveredReceiver>,
     isSearching: Boolean,
     onRefreshDiscovery: () -> Unit,
-    onConnectDevice: (name: String, host: String) -> Unit,
+    onConnectDevice: (name: String, host: String, port: Int) -> Unit,
     onDisconnectDevice: () -> Unit
 ) {
     var ipText by remember { mutableStateOf("") }
@@ -1058,7 +1157,7 @@ fun ConnectionScreen(
                                 }
                             } else {
                                 Button(
-                                    onClick = { onConnectDevice(receiver.name, receiver.host) },
+                                    onClick = { onConnectDevice(receiver.name, receiver.host, receiver.port) },
                                     colors = ButtonDefaults.buttonColors(
                                         containerColor = VividBlue,
                                         contentColor = PureWhite
@@ -1104,7 +1203,7 @@ fun ConnectionScreen(
                     Button(
                         onClick = {
                             if (ipText.isNotBlank()) {
-                                onConnectDevice("TV Receiver ($ipText)", ipText)
+                                onConnectDevice("TV Receiver ($ipText)", ipText, 8765)
                             }
                         },
                         enabled = ipText.isNotBlank(),
@@ -1537,24 +1636,47 @@ fun LivePresenterScreen(
 // TAB 2: SONG LIBRARY SCREEN
 // ============================================================================
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SongLibraryScreen(
     songs: List<Song>,
+    folders: List<SongFolder>,
     activeSong: Song?,
     onSelectSong: (Song) -> Unit,
     onEditSong: (Song) -> Unit,
     onDeleteSong: (Song) -> Unit,
+    onMoveSong: (Song, String?) -> Unit,
+    onCreateFolder: (String) -> Unit,
+    onRenameFolder: (SongFolder, String) -> Unit,
+    onDeleteFolder: (SongFolder) -> Unit,
     onCreateNew: () -> Unit,
     onImportTxtFiles: () -> Unit
 ) {
     var searchQuery by remember { mutableStateOf("") }
-    
-    val filteredSongs = remember(songs, searchQuery) {
-        if (searchQuery.isBlank()) songs
-        else songs.filter {
-            it.title.contains(searchQuery, ignoreCase = true) ||
-                    (it.author?.contains(searchQuery, ignoreCase = true) == true)
+    var sortOption by remember { mutableStateOf(SongSortOption.RELEVANCE) }
+    var sortMenuExpanded by remember { mutableStateOf(false) }
+    var selectedFolderId by remember { mutableStateOf<String?>(null) }
+    var showFolderEditor by remember { mutableStateOf(false) }
+    var folderBeingEdited by remember { mutableStateOf<SongFolder?>(null) }
+    var folderName by remember { mutableStateOf("") }
+    var folderToDelete by remember { mutableStateOf<SongFolder?>(null) }
+
+    LaunchedEffect(folders, selectedFolderId) {
+        if (selectedFolderId != null && selectedFolderId != UNFILED_FOLDER_ID && folders.none { it.id == selectedFolderId }) {
+            selectedFolderId = null
         }
+    }
+
+    val visibleSongs = remember(songs, folders, selectedFolderId, searchQuery, sortOption) {
+        val folderSongs = when (selectedFolderId) {
+            null -> songs
+            UNFILED_FOLDER_ID -> songs.filter { song -> song.folderId == null || folders.none { it.id == song.folderId } }
+            else -> songs.filter { it.folderId == selectedFolderId }
+        }
+        filterAndSortSongs(folderSongs, searchQuery, sortOption)
+    }
+    val duplicateFolderName = folderName.trim().isNotEmpty() && folders.any {
+        it.name.equals(folderName.trim(), ignoreCase = true) && it.id != folderBeingEdited?.id
     }
 
     Column(
@@ -1575,6 +1697,13 @@ fun SongLibraryScreen(
                 color = VividBlue
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                IconButton(onClick = {
+                    folderBeingEdited = null
+                    folderName = ""
+                    showFolderEditor = true
+                }) {
+                    Icon(Icons.Default.CreateNewFolder, contentDescription = "Create song folder", tint = VividBlue)
+                }
                 OutlinedButton(
                     onClick = onImportTxtFiles,
                     shape = RoundedCornerShape(8.dp)
@@ -1601,14 +1730,70 @@ fun SongLibraryScreen(
         OutlinedTextField(
             value = searchQuery,
             onValueChange = { searchQuery = it },
-            placeholder = { Text("Search songs...") },
+            placeholder = { Text("Search titles or authors; typos are OK") },
+            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
-        if (filteredSongs.isEmpty()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box {
+                OutlinedButton(onClick = { sortMenuExpanded = true }) {
+                    Icon(Icons.Default.Sort, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(sortOption.label)
+                }
+                DropdownMenu(expanded = sortMenuExpanded, onDismissRequest = { sortMenuExpanded = false }) {
+                    SongSortOption.entries.forEach { option ->
+                        DropdownMenuItem(
+                            text = { Text(option.label) },
+                            onClick = { sortOption = option; sortMenuExpanded = false }
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            Text("${visibleSongs.size} songs", color = TextMuted, style = MaterialTheme.typography.labelMedium)
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            FilterChip(selected = selectedFolderId == null, onClick = { selectedFolderId = null }, label = { Text("All songs (${songs.size})") })
+            val unfiledCount = songs.count { song -> song.folderId == null || folders.none { it.id == song.folderId } }
+            FilterChip(selected = selectedFolderId == UNFILED_FOLDER_ID, onClick = { selectedFolderId = UNFILED_FOLDER_ID }, label = { Text("Unfiled ($unfiledCount)") })
+            folders.forEach { folder ->
+                val count = songs.count { it.folderId == folder.id }
+                FilterChip(
+                    selected = selectedFolderId == folder.id,
+                    onClick = { selectedFolderId = folder.id },
+                    label = { Text("${folder.name} ($count)") },
+                    leadingIcon = { Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                )
+            }
+        }
+
+        folders.firstOrNull { it.id == selectedFolderId }?.let { folder ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = { folderBeingEdited = folder; folderName = folder.name; showFolderEditor = true }) {
+                    Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp)); Text("Rename folder")
+                }
+                TextButton(onClick = { folderToDelete = folder }) {
+                    Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp)); Text("Delete folder")
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        if (visibleSongs.isEmpty()) {
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -1617,7 +1802,13 @@ fun SongLibraryScreen(
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
-                        text = if (searchQuery.isNotBlank()) "No songs match \"$searchQuery\"" else "No songs in library yet.",
+                        text = when {
+                            searchQuery.isNotBlank() -> "No songs match \"$searchQuery\""
+                            songs.isEmpty() -> "No songs in library yet."
+                            selectedFolderId == UNFILED_FOLDER_ID -> "No unfiled songs."
+                            selectedFolderId != null -> "This folder is empty."
+                            else -> "No songs to show."
+                        },
                         color = TextMuted
                     )
                     Spacer(modifier = Modifier.height(12.dp))
@@ -1637,7 +1828,7 @@ fun SongLibraryScreen(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                items(filteredSongs, key = { it.id }) { song ->
+                items(visibleSongs, key = { it.id }) { song ->
                     val isActive = activeSong?.id == song.id
                     Card(
                         modifier = Modifier
@@ -1664,7 +1855,7 @@ fun SongLibraryScreen(
                                         color = TextDark
                                     )
                                     Text(
-                                        text = "${song.author ?: "Unknown Author"} • ${song.slides.size} slides",
+                                        text = "${song.author ?: "Unknown Author"} • ${song.slides.size} slides • ${folders.firstOrNull { it.id == song.folderId }?.name ?: "Unfiled"}",
                                         fontSize = 13.sp,
                                         color = TextMuted
                                     )
@@ -1680,6 +1871,27 @@ fun SongLibraryScreen(
                                             fontWeight = FontWeight.Bold,
                                             color = GlowingCyan,
                                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            var moveMenuExpanded by remember { mutableStateOf(false) }
+                            Box {
+                                TextButton(onClick = { moveMenuExpanded = true }) {
+                                    Icon(Icons.Default.DriveFileMove, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Move to folder")
+                                }
+                                DropdownMenu(expanded = moveMenuExpanded, onDismissRequest = { moveMenuExpanded = false }) {
+                                    DropdownMenuItem(
+                                        text = { Text("Unfiled") },
+                                        onClick = { onMoveSong(song, null); moveMenuExpanded = false }
+                                    )
+                                    folders.forEach { folder ->
+                                        DropdownMenuItem(
+                                            text = { Text(folder.name) },
+                                            onClick = { onMoveSong(song, folder.id); moveMenuExpanded = false }
                                         )
                                     }
                                 }
@@ -1722,7 +1934,50 @@ fun SongLibraryScreen(
             }
         }
     }
+
+    if (showFolderEditor) {
+        AlertDialog(
+            onDismissRequest = { showFolderEditor = false },
+            title = { Text(if (folderBeingEdited == null) "Create folder" else "Rename folder") },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = folderName,
+                        onValueChange = { folderName = it },
+                        label = { Text("Folder name") },
+                        singleLine = true
+                    )
+                    if (duplicateFolderName) Text("A folder with that name already exists.", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = folderName.isNotBlank() && !duplicateFolderName,
+                    onClick = {
+                        val old = folderBeingEdited
+                        if (old == null) onCreateFolder(folderName.trim()) else onRenameFolder(old, folderName.trim())
+                        showFolderEditor = false
+                    }
+                ) { Text(if (folderBeingEdited == null) "Create" else "Save") }
+            },
+            dismissButton = { TextButton(onClick = { showFolderEditor = false }) { Text("Cancel") } }
+        )
+    }
+
+    folderToDelete?.let { folder ->
+        AlertDialog(
+            onDismissRequest = { folderToDelete = null },
+            title = { Text("Delete ${folder.name}?") },
+            text = { Text("Songs in this folder will remain in your library as unfiled songs.") },
+            confirmButton = {
+                TextButton(onClick = { onDeleteFolder(folder); selectedFolderId = null; folderToDelete = null }) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { folderToDelete = null }) { Text("Cancel") } }
+        )
+    }
 }
+
+private const val UNFILED_FOLDER_ID = "__unfiled__"
 
 // Helper to convert font string to Compose FontFamily
 fun getCustomFontFamily(fontFamilyStr: String): FontFamily {
@@ -1795,6 +2050,7 @@ fun FreeShowCreatorScreen(
         textColor = template.textColor
         backgroundType = when (template.backgroundType) {
             TemplateBackgroundType.SOLID -> "COLOR"
+            TemplateBackgroundType.GRADIENT -> "GRADIENT"
             TemplateBackgroundType.IMAGE -> "IMAGE"
             TemplateBackgroundType.VIDEO -> "VIDEO"
             TemplateBackgroundType.NONE -> "NONE"

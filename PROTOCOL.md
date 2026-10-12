@@ -17,6 +17,49 @@ The controller app sends commands such as `NEXT_SLIDE`, `PREV_SLIDE`, `JUMP_SLID
 - Controller is the active client; receiver is the server
 - Optional network discovery via NSD/mDNS to avoid manual IP entry
 
+The protocol carries two categories of information:
+
+1. **State snapshots**, primarily `DISPLAY`, which provide enough context for
+the receiver to render a selected song and its current slide.
+2. **Small actions**, such as navigation, black/clear, style, and layer
+commands, which change only the state they name.
+
+This distinction is important during a service: the full slide list is loaded
+once per song (and after recovery), while next/previous/jump messages do not
+send song text. Media bytes never belong in WebSocket JSON; they use the
+receiver's HTTP service.
+
+### End-to-end command flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UI as Controller UI
+    participant Svc as Controller connection service
+    participant TV as Receiver WebSocket server
+    participant State as Receiver display state
+    participant Screen as TV output
+    UI->>Svc: Connect to chosen or remembered receiver
+    Svc->>TV: WebSocket upgrade
+    Svc->>TV: HANDSHAKE(protocolVersion=2)
+    TV->>State: Reset output to BLANK
+    TV-->>Svc: ACK(HANDSHAKE, media endpoint, empty layers)
+    Svc-->>UI: Connected + confirmed blank state
+    UI->>Svc: DISPLAY(song, slides, style)
+    Svc->>TV: DISPLAY
+    TV->>State: Cache slide list; set active slide and style
+    State->>Screen: Render lyrics / background / overlay
+    TV-->>Svc: ACK(DISPLAY, currentSlide, layerState)
+    UI->>Svc: NEXT_SLIDE (small command)
+    Svc->>TV: NEXT_SLIDE
+    TV->>State: Change lyrics/index only
+    State->>Screen: Update lyrics, retain media
+    TV-->>Svc: ACK(NEXT_SLIDE, currentSlide, layerState)
+```
+
+The phone optimistically advances its preview on a tap; a failed ACK can roll
+that preview back. The ACK is still the authoritative report of receiver state.
+
 ## Connection lifecycle
 
 ```mermaid
@@ -26,13 +69,15 @@ sequenceDiagram
     participant T as TV Display
 
     C->>R: Connect WebSocket to receiver host:8765
-    R-->>C: Connection accepted
-    C->>R: DISPLAY with song + slide data
+    C->>R: HANDSHAKE with protocolVersion=2
+    R-->>C: ACK with protocol/media/layer metadata
+    R->>T: Clear to pure black BLANK
+    C->>R: DISPLAY after operator selects content or recovery state
     R->>T: Render current slide
     R-->>C: ACK
 
     loop while connected
-        C->>R: HEARTBEAT every 10s
+        C->>R: HEARTBEAT every 30s
         R-->>C: HEARTBEAT_ACK
     end
 
@@ -56,7 +101,15 @@ All messages are JSON objects and include a type field. The payload may vary by 
 
 ### Handshake and connection state (protocol version 2)
 
-The WebSocket upgrade remains unchanged. On every successful connection, the
+The WebSocket upgrade remains unchanged. The controller sends a `HANDSHAKE`
+message immediately after opening the socket. Its `protocolVersion` field is
+optional for compatibility; current clients send version 2:
+
+```json
+{"type":"HANDSHAKE","protocolVersion":2,"timestamp":1720000000000}
+```
+
+On every successful connection, the
 receiver clears the visible output to pure black and sends a successful ACK for
 `HANDSHAKE`. It includes `protocolVersion`, the embedded media HTTP port, the
 current `layerState`, and optional `screenWidthDp` / `screenHeightDp` values for
@@ -67,14 +120,18 @@ show command; connection status and address UI is shown only while disconnected.
 
 ```json
 {"type":"ACK","receivedMessageType":"HANDSHAKE","success":true,
- "protocolVersion":2,"mediaPort":8766,"screenWidthDp":1920,"screenHeightDp":1080,
+ "protocolVersion":2,"mediaPort":8766,"mediaHost":"192.168.1.12","screenWidthDp":1920,"screenHeightDp":1080,
  "layerState":{"background":false,"lyrics":false,"overlay":false},
  "timestamp":1720000000000}
 ```
 
-All ACKs may include `screenState` (`BLANK`, `BLACK`, or `CONTENT`) and a
-`layerState` object. These additions do not change the legacy `success`,
+All command ACKs may include `screenState` (`BLANK`, `BLACK`, or `CONTENT`) and a
+complete `layerState` object with `background`, `lyrics`, and `overlay` booleans.
+These additions do not change the legacy `success`,
 `currentSlide`, or `error` fields; older ACK readers may ignore them.
+Receivers echo the request timestamp as `commandTimestamp` and may include
+`renderTimestamp`; `SET_BACKGROUND` ACKs may also echo `mediaId` for actionable
+controller error feedback.
 
 ## Standard message types
 
@@ -111,6 +168,11 @@ Jumps directly to a specific slide index.
 
 ### 4. `DISPLAY`
 Provides the current song payload and slide list. This is typically sent when the operator connects or changes song/setlist.
+
+After a song has been loaded, navigation messages stay command-only: the
+controller sends `type`, `timestamp`, and `slideIndex` only for a jump. It
+updates its local current/next slide preview optimistically while the receiver
+moves through its cached `DISPLAY.slides` list.
 
 ```json
 {
@@ -158,6 +220,8 @@ Acknowledges a command after the receiver has processed it.
   "receivedMessageType": "NEXT_SLIDE",
   "success": true,
   "currentSlide": 1,
+  "commandTimestamp": 1720000000000,
+  "renderTimestamp": 1720000000042,
   "timestamp": 1720000000000
 }
 ```
@@ -212,7 +276,7 @@ A simple state diagram:
 stateDiagram-v2
     [*] --> Disconnected
     Disconnected --> Connected: WebSocket open
-    Connected --> Blank: WebSocket open / HANDSHAKE
+    Connected --> Blank: HANDSHAKE accepted
     Blank --> Content: DISPLAY or SET_BACKGROUND or show command
     Content --> BlackScreen: BLACK_SCREEN (background state retained)
     BlackScreen --> Content: CLEAR_SCREEN (lyrics cleared; background retained)
@@ -220,6 +284,51 @@ stateDiagram-v2
     Blank --> Disconnected: connection lost
     Content --> Disconnected: connection lost
     BlackScreen --> Disconnected: connection lost
+```
+
+The screen state describes the visible mode, while `layerState` describes
+which independent content layers remain configured. Do not infer that a layer
+was deleted just because the screen is currently black.
+
+| Command | Lyrics layer | Background layer | Overlay layer | Visible-state effect |
+| --- | --- | --- | --- | --- |
+| `DISPLAY` | Replaces current song/slide/style | Kept unless a usable media URL is explicitly supplied | Updated only by supplied style/display values | Shows the requested slide |
+| `NEXT_SLIDE`, `PREV_SLIDE`, `JUMP_SLIDE` | Changes current slide | Kept | Kept | Shows the selected slide |
+| `SET_BACKGROUND` | Kept | Replaced with selected media | Kept | Media appears behind lyrics if present |
+| `CLEAR_LYRICS` | Cleared | Kept | Kept | Background-only if media exists |
+| `CLEAR_SCREEN` | Cleared; removes black override | Kept | Kept | Background-only or empty content state |
+| `CLEAR_BACKGROUND` | Kept | Cleared | Kept | Lyrics-only if lyrics exist |
+| `CLEAR_OVERLAY` | Kept | Kept | Cleared | Removes dim layer |
+| `BLACK_SCREEN` | Retained | Retained and may continue playing | Retained | Covers the entire output with black |
+| `CLEAR_ALL` | Cleared | Cleared | Cleared | Returns to pure-black `BLANK` |
+
+`CLEAR_SCREEN` is the legacy user-facing “clear lyrics / remove black cover” action;
+it is intentionally different from `CLEAR_ALL`. The receiver's layer state
+ACK lets the controller distinguish these outcomes instead of guessing from
+which button was pressed.
+
+```mermaid
+flowchart TB
+    Open[WebSocket opens] --> Hello[HANDSHAKE v2]
+    Hello --> Blank[BLANK · pure black · all layers off]
+    Blank --> Display[DISPLAY]
+    Blank --> Media[SET_BACKGROUND]
+    Blank --> Template[APPLY_TEMPLATE / show]
+    Display --> Layers[Connected output with independent layers]
+    Media --> Layers
+    Template --> Layers
+    Layers --> Next[Slide command updates lyrics only]
+    Next --> Layers
+    Layers --> Black[BLACK_SCREEN covers output, keeps layers]
+    Black --> ClearScreen[CLEAR_SCREEN removes lyrics + black override]
+    ClearScreen --> Layers
+    Layers --> ClearLyrics[CLEAR_LYRICS]
+    ClearLyrics --> BackgroundOnly[Background-only or empty]
+    Layers --> ClearBg[CLEAR_BACKGROUND]
+    ClearBg --> LyricsOnly[Lyrics-only or empty]
+    Layers --> All[CLEAR_ALL]
+    Black --> All
+    All --> Blank
 ```
 
 `Blank` and `BlackScreen` are distinct states. `Blank` is the receiver's
@@ -270,6 +379,20 @@ The receiver should:
 - preserve background media across lyric changes, black overrides, and
   `CLEAR_SCREEN`; remove it only for `CLEAR_BACKGROUND` or `CLEAR_ALL`
 
+The controller sends application `HEARTBEAT` every 30 seconds and the receiver
+immediately replies `HEARTBEAT_ACK`. One missed response is tolerated; the
+controller marks the socket unhealthy/reconnects only after two missed
+responses (about 60 seconds). WebSocket ping frames run independently to keep
+intermediate NAT/AP state alive. ACKs echo the request `timestamp` as optional
+`commandTimestamp`; `renderTimestamp` records receiver-side applied-state time
+for navigation latency diagnostics.
+
+The current controller also configures a 25-second WebSocket ping interval.
+Application heartbeat and WebSocket ping/pong are separate keepalive paths;
+neither changes the message envelope or the semantics of the 30-second
+application heartbeat. Navigation commands remain small and do not carry the
+song or slide list.
+
 ## Controller behavior rules
 
 The controller should:
@@ -279,6 +402,11 @@ The controller should:
 - resend the latest `DISPLAY` after a reconnect to restore state
 - retry with exponential backoff if the connection is lost
 - log connection changes but keep the UI responsive
+- show transient messages for connection events and issues; successful
+  presentation changes do not require a toast
+
+The controller's message surface dismisses after one second. This is UI
+behavior, not a protocol requirement.
 
 ## Reconnect and recovery behavior
 
@@ -389,16 +517,75 @@ using optional capabilities.
 {"type":"CLEAR_LYRICS","timestamp":1720000000000}
 {"type":"CLEAR_OVERLAY","timestamp":1720000000000}
 {"type":"CLEAR_ALL","timestamp":1720000000000}
-{"type":"APPLY_TEMPLATE","template":{"id":"builtin-classic","name":"Classic White on Black","isDefault":true,"isBuiltIn":true,"fontFamily":"SansSerif","fontSize":48,"bold":false,"italic":false,"textColor":"#FFFFFFFF","horizontalAlignment":"center","verticalAlignment":"center","lineSpacing":1.25,"backgroundType":"SOLID","backgroundColor":"#FF000000","mediaFitMode":"FILL","overlayDimPercent":0,"paddingDp":40,"marginDp":0,"backgroundMediaUrl":"http://192.168.1.12:8766/media/abc123"},"timestamp":1720000000000}
+{"type":"APPLY_TEMPLATE","template":{"id":"builtin-classic","name":"Classic White on Black","isDefault":true,"isBuiltIn":true,"fontFamily":"SansSerif","fontSize":48,"bold":false,"italic":false,"textColor":"#FFFFFFFF","horizontalAlignment":"center","verticalAlignment":"center","lineSpacing":1.25,"shadowColor":null,"outlineColor":null,"backgroundType":"SOLID","backgroundColor":"#FF000000","backgroundGradientEndColor":null,"backgroundMediaId":null,"mediaFitMode":"FILL","overlayDimPercent":0,"paddingDp":40,"marginDp":0},"timestamp":1720000000000}
 {"type":"UPDATE_STYLE","textColor":"#FFFFFFFF","bgColor":"#FF000000","backgroundAlpha":40,"timestamp":1720000000000}
 {"type":"MEDIA_READY","mediaId":"abc123","url":"http://192.168.1.12:8766/media/abc123","timestamp":1720000000000}
 {"type":"MEDIA_ERROR","mediaId":"abc123","reason":"Unsupported media type","timestamp":1720000000000}
 ```
 
-The receiver hosts a local HTTP endpoint on port 8766. The controller streams
-a chosen image/video with `POST /media` using chunked transfer encoding and a
-media `Content-Type`. A successful response contains `mediaId`, relative `url`,
-and `type`; the receiver also emits `MEDIA_READY`. `GET /media/{mediaId}`
+### Template and style field meanings
+
+`APPLY_TEMPLATE.template` is a self-contained rendering description. Receivers
+apply the supplied values immediately and do not need a local copy of the
+controller's template database. Current fields are:
+
+- Identity: `id`, `name`, `isDefault`, and `isBuiltIn`.
+- Typography: `fontFamily`, `fontSize`, `bold`, `italic`, and `lineSpacing`.
+- Text appearance: `textColor`, optional `shadowColor`, and optional
+  `outlineColor`.
+- Placement: `horizontalAlignment` (`left`, `center`, `right`),
+  `verticalAlignment` (`top`, `center`, `bottom`), `paddingDp`, and
+  `marginDp`.
+- Background: `backgroundType` (`SOLID`, `GRADIENT`, `IMAGE`, `VIDEO`,
+  `NONE`), `backgroundColor`, optional `backgroundGradientEndColor`,
+  optional `backgroundMediaId`, optional receiver-reachable
+  `backgroundMediaUrl`, and `mediaFitMode` (`FILL`, `FIT`, `STRETCH`).
+- Layer presentation: `overlayDimPercent` from 0 to 100.
+
+Color strings accept Android-compatible hex notation; the controller emits
+ARGB values such as `#FFFFFFFF`. Unknown optional fields should be ignored.
+New fields must be optional or have defaults so older protocol v2 senders and
+receivers remain interoperable. `UPDATE_STYLE` can carry only the style fields
+that changed; omitted values mean “keep the receiver's current value.”
+
+### Media upload and playback timeline
+
+```mermaid
+sequenceDiagram
+    participant C as Controller
+    participant H as Receiver HTTP server :8766
+    participant F as Receiver cache file
+    participant W as Receiver WebSocket :8765
+    participant P as Receiver player / image loader
+    C->>H: POST /media (chunked bytes, Content-Type)
+    H->>F: Stream to cache; validate type and size
+    H-->>C: Upload response(mediaId, url, type)
+    H-->>W: MEDIA_READY(mediaId, url)
+    C->>W: SET_BACKGROUND(mediaId, mediaType, mediaUrl, fit, loop, muted)
+    W->>P: Activate independent background layer
+    P->>H: GET /media/{mediaId}, optional Range header
+    H-->>P: 200 full file or 206 Partial Content
+    W-->>C: ACK with layerState
+    alt Upload or playback fails
+        H-->>W: MEDIA_ERROR(mediaId, reason)
+        W-->>C: Friendly actionable error
+    end
+```
+
+The receiver is the media host. It must bind to all local interfaces but must
+publish a specific reachable LAN address, never `0.0.0.0`, `localhost`, or a
+loopback address, in URLs returned to the controller. A range response must
+include `206 Partial Content`, `Content-Range`, `Content-Length`,
+`Accept-Ranges: bytes`, and the detected media MIME type. Uploads are capped
+at 2 GiB. Cache cleanup must not delete a media file currently in use.
+
+The receiver hosts a local HTTP endpoint on port 8766 bound to `0.0.0.0`. The
+controller streams a chosen image/video with `POST /media` using chunked
+transfer encoding and a media `Content-Type`. A successful response contains
+`mediaId`, an absolute LAN `url`, and `type`; the receiver also emits
+`MEDIA_READY`. The URL host is the local address of the same receiver network
+interface that accepted the active WebSocket, announced as `mediaHost` in the
+handshake ACK. Loopback/localhost URLs must never be sent. `GET /media/{mediaId}`
 supports byte ranges for video seeking. The endpoint rejects non-media types
 and files over 2 GiB. Storage or decoding errors should be reported using
 `MEDIA_ERROR` and a failed `ACK` where possible.

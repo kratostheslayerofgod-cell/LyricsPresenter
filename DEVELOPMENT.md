@@ -33,13 +33,104 @@ d:\slideshow
 └── LICENSE
 ```
 
+### Runtime responsibilities
+
+```mermaid
+flowchart TB
+    subgraph Controller[controller app · phone]
+        Activity[MainActivity and Compose screens]
+        Conn[ConnectionKeepAliveService]
+        WsClient[WebSocketClientManager]
+        Discovery[DiscoveryManager / NSD]
+        MediaClient[MediaUploadClient]
+        Repo[SongRepository]
+        Room[(Room database)]
+        Prefs[PresenterPreferences / DataStore]
+        Activity --> Conn --> WsClient
+        Activity --> Discovery
+        Activity --> MediaClient
+        Activity --> Repo --> Room
+        Activity --> Prefs
+    end
+    subgraph Receiver[receiver app · TV]
+        WsServer[SimpleWebSocketServer]
+        HttpServer[EmbeddedMediaServer]
+        Handler[Receiver display state handler]
+        Cache[(Receiver cache)]
+        UI[Compose full-screen output]
+        Player[Coil / Media3]
+        WsServer --> Handler --> UI
+        HttpServer --> Cache --> Player --> UI
+    end
+    WsClient <--> WsServer
+    MediaClient --> HttpServer
+    Discovery -. receiver endpoint .-> WsClient
+    Shared[shared module\nmodels and serialization] --- Activity
+    Shared --- Handler
+```
+
+The controller Activity owns screen navigation and user intent; it binds to a foreground connection service so the socket does not belong to a particular Activity instance. The repository is the boundary around persisted songs and folders. DataStore preferences supply templates, colors, remembered receiver, and presentation recovery data. The receiver owns the actual render state and resolves uploaded media from its own cache; it never opens the controller's local picker URI.
+
+### Song-to-screen data flow
+
+```mermaid
+flowchart LR
+    Input[Type lyrics or import TXT] --> Parse[Parse sections and split slides]
+    Parse --> Song[Song + sections + slides]
+    Song --> Persist[(Room)]
+    Persist --> Catalog[Search / sort / folder filter]
+    Catalog --> Select[Select a song]
+    Select --> Style[Resolve song style + selected template]
+    Style --> Display[DISPLAY payload]
+    Display --> Receiver[Receiver caches slide list and index]
+    Receiver --> Visible[Current lyrics composable]
+    Tap[Next / previous / jump] --> Nav[Small navigation command]
+    Nav --> Receiver
+    Receiver --> Ack[ACK currentSlide + state]
+    Ack --> Preview[Reconcile live preview]
+```
+
+TXT parsing recognizes common section headings and blank-line slide breaks. Edits are stored as structured sections and slides. Search, sorting, and folder assignment organize the library without affecting how slides are sent. The first `DISPLAY` carries the song's slides and resolved display settings; following navigation messages carry only the requested movement. An ACK confirms what index and layers the receiver applied.
+
+### Background upload and playback flow
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator / controller
+    participant Pick as Android Photo Picker
+    participant Upload as MediaUploadClient
+    participant HTTP as Receiver HTTP :8766
+    participant Store as Receiver cache
+    participant WS as Receiver WebSocket :8765
+    participant TV as TV renderer
+    Op->>Pick: Choose image or video
+    Pick-->>Op: Local content URI (phone only)
+    Op->>Upload: Stream selected file in request body
+    Upload->>HTTP: POST /media (chunked)
+    HTTP->>Store: Write and validate file
+    HTTP-->>Upload: mediaId + receiver LAN URL
+    HTTP-->>WS: MEDIA_READY (while control socket is open)
+    Op->>WS: SET_BACKGROUND(mediaId, type, fit, loop, muted)
+    WS->>TV: Update background layer
+    TV->>Store: GET /media/{mediaId} (range requests for video)
+    TV-->>WS: ACK with complete layer state
+    WS-->>Op: ACK
+```
+
+Upload and render are distinct stages: `MEDIA_READY` means the receiver accepted and stored the bytes; `SET_BACKGROUND` makes the item visible. Keep the exact receiver LAN host from the active connection when diagnosing network failures. If a user selects media before a connection is available, the controller may retain the picker reference, but the phone-local URI is not a usable TV playback URL.
+
 ## Local environment requirements
 
-- Android Studio 2023.1 or newer
-- Android SDK with API 30+ enabled
-- JDK 11 or newer
-- Gradle 8.1 or newer
+- Android Studio with Android Gradle Plugin 8.13.2 support
+- Android SDK platform 34 and a suitable Android build tools installation
+- JDK 17 (the project compiles Kotlin and Java to JVM 17 bytecode)
+- Use the checked-in Gradle wrapper; it downloads/launches Gradle 9.3.0
 - A phone and an Android TV, or Android emulator variants for both
+
+The controller minimum SDK is 26 and the receiver/shared minimum SDK is 24.
+Both apps target SDK 34. A newer Android Studio may bundle a JDK that the
+wrapper can use; if Gradle reports an unsupported runtime, select JDK 17 under
+**Settings → Build, Execution, Deployment → Build Tools → Gradle → Gradle JDK**.
 
 ## First-time setup
 
@@ -148,6 +239,66 @@ For the best validation you should run:
 3. Wait for the controller to mark the connection as disconnected
 4. Restore connectivity
 5. Confirm the app reconnects and resumes from the latest display state
+
+## Low-latency navigation and connection recovery
+
+- The controller remembers the last receiver endpoint (host, WebSocket port,
+  and display name) in DataStore and attempts it as soon as the connection
+  service binds. NSD discovery continues in parallel and publishes each
+  resolved service as it arrives.
+- `NEXT_SLIDE`, `PREV_SLIDE`, and `JUMP_SLIDE` are queued as compact commands;
+  they do not resend song text. The controller preview updates optimistically.
+- Application heartbeats run every 30 seconds; one missed ACK is tolerated and
+  a reconnect begins only after two misses. OkHttp ping frames run every 25
+  seconds. Reconnect delays are capped at 16 seconds.
+- While connected, both apps hold a high-performance Wi-Fi lock; the
+  controller service also holds a partial wake lock. Some Chinese OEM ROMs
+  still require allowing background activity / disabling app battery limits.
+- Use `adb logcat -s SlideLatency` to read controller ACK round-trip timing and
+  receiver command-to-render timing. These are diagnostic timestamps; actual
+  phone-to-TV visual latency must be measured with the two target devices.
+
+## Cross-device background media
+
+The receiver is the HTTP server and the controller pushes selected media with
+chunked `POST /media`. This avoids requiring the receiver to read a
+phone-local `content://` URI. Port 8766 binds explicitly to `0.0.0.0`; its
+upload response and `MEDIA_READY` use an absolute LAN URL built from the local
+address of the same network interface that accepted the current WebSocket.
+The handshake ACK advertises `mediaHost` and `mediaPort`, and the controller
+uses those values for both upload and playback URLs. The receiver serves
+`GET /media/{mediaId}` with byte-range support for Media3 seeking. Cleartext
+HTTP is enabled by the app manifests for this local-network transport.
+
+To validate with two devices, connect the phone to the TV receiver, upload one
+image and one video, confirm that neither `MEDIA_READY` nor `SET_BACKGROUND`
+contains `localhost`/`127.0.0.1`, then step through slides and verify the
+background persists. Test `CLEAR_SCREEN`, `BLACK_SCREEN`, and
+`CLEAR_BACKGROUND` separately. Receiver startup and range responses are logged
+under `MediaServer`.
+
+## Connection, error, and feedback path
+
+```mermaid
+flowchart TD
+    Event[Socket callback / ACK / media result / persistence failure] --> Parse[Guarded parsing and validation]
+    Parse --> Kind{Outcome}
+    Kind -- Expected successful presentation action --> Quiet[Update UI and confirmed layer state silently]
+    Kind -- Connect / disconnect / reconnect --> ConnectionCopy[AppMessages connection copy]
+    Kind -- Failed ACK or MEDIA_ERROR --> Friendly[Map to short localized message]
+    Kind -- Local exception --> Classify[Classify as network, storage, media, or generic]
+    ConnectionCopy --> Host[AppMessageHost]
+    Friendly --> Host
+    Classify --> Host
+    Host -->|about one second| Dismiss[Dismiss transient message]
+    Host -->|action needed| Action[Retry / review song / open media or connection]
+```
+
+Protocol JSON and exception details are for diagnostics, not user-facing copy.
+Use `AppMessages` to map failures to localized title, cause, severity, and
+next action. Successful slide, clear, black, template, and style changes are
+kept quiet; brief messages are for connection changes and issues that need
+operator awareness. Detailed diagnostics belong in Logcat.
 
 ## Heartbeat validation
 
@@ -272,8 +423,10 @@ at or above 3840x2160 when available; devices without that mode keep their
 native resolution and still render edge-to-edge. The song creator uses a 16:9
 preview scaled against the receiver's logical display width. The live template
 picker is collapsed by default and expands inline when its header is selected.
-The controller turns ACKs into short status toasts rather than rendering raw
-protocol JSON in the app.
+The controller turns connection events and failures into short, friendly
+messages instead of rendering raw protocol JSON. Successful presentation
+changes (slide navigation, clear/black actions, style/template changes, and
+media-ready notifications) stay silent. Messages disappear after one second.
 
 For cross-device media playback, the controller builds the media URL from the
 same resolved receiver host used by its WebSocket connection. The receiver
@@ -288,6 +441,11 @@ media messages. Older protocol fields and command names are unchanged. Built-in
 templates are immutable; custom templates are stored as JSON in controller
 DataStore. Template payloads travel in full with `APPLY_TEMPLATE`, so the TV
 does not need the controller's template store.
+
+Template metadata includes an outline color for future-compatible style
+payloads, but the current receiver renderer only draws text shadow; an outline
+stroke is not yet visible on the TV. The color controls themselves and
+background color/gradient rendering are separate, supported settings.
 
 ## Log commands
 
@@ -305,19 +463,32 @@ adb devices
 - Validate on actual Android TV hardware before broad feature expansion
 - Make display readability a top priority; it matters more than aesthetics in a live church setting
 
-## Recommended implementation order
+## Current validation checklist
 
-1. Finish the local WebSocket contract
-2. Verify receiver and controller connect reliably
-3. Add discovery and recovery flow
-4. Add local persistence and song editing
-5. Add live control and setlist features
-6. Add display polish and theme settings
-7. Test on real Android TV devices and hotspot mode
+The application features described above are implemented in code, but device-
+specific behavior must still be verified. On a phone and TV on separate devices:
 
-## Summary
+- [ ] Build all modules with `./gradlew build`.
+- [ ] Connect, confirm the receiver becomes pure black, and display a song.
+- [ ] Rapidly navigate and compare visible TV timing with `SlideLatency` logs.
+- [ ] Confirm only connection/error events produce transient messages and they
+  disappear after about one second.
+- [ ] Upload a 1080p image and video; verify the URLs use the receiver LAN IP.
+- [ ] Step through slides while video plays; clear lyrics/background/all
+  independently and reconnect Wi-Fi.
+- [ ] Reapply a built-in and saved custom template after app restart.
+- [ ] Search with a title typo, change sort order, create a folder, move songs, and verify folders persist after restart.
+- [ ] Check Telugu text, TV focus, 4K mode selection, and long-session memory.
 
-The project is intentionally being built in tight phases. The early phase focuses on proving that a phone can reliably control an Android TV screen over a local network. Once that is stable, all downstream features such as song editing, setlists, and display themes can be built on top of a proven connection layer.
+Do not interpret an unchecked item as a known code failure; it identifies a
+manual acceptance check that requires the target hardware or a fresh build.
+
+## Current implementation focus
+
+Core controller, receiver, protocol, media transport, templates, and layer
+controls are present. Remaining work is compatibility and acceptance testing:
+TV codec support, real-network media reliability, visible latency, background
+survival across long sessions, and visual parity on different TV models.
 
 ## Presentation connection reliability
 

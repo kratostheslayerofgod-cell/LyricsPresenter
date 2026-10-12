@@ -21,6 +21,21 @@ interface LibraryDao {
     @Delete
     suspend fun deleteSong(song: SongEntity)
 
+    @Query("UPDATE songs SET folderId = :folderId WHERE id = :songId")
+    suspend fun moveSong(songId: String, folderId: String?)
+
+    @Query("UPDATE songs SET folderId = NULL WHERE folderId = :folderId")
+    suspend fun moveFolderSongsToUnfiled(folderId: String)
+
+    @Query("SELECT * FROM song_folders ORDER BY name COLLATE NOCASE")
+    fun observeFolders(): Flow<List<SongFolderEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun saveFolder(folder: SongFolderEntity)
+
+    @Query("DELETE FROM song_folders WHERE id = :folderId")
+    suspend fun deleteFolder(folderId: String)
+
     @Query("SELECT * FROM setlists ORDER BY updatedAt DESC")
     fun observeSetlists(): Flow<List<SetlistEntity>>
 
